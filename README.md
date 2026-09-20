@@ -35,6 +35,7 @@ procedural shapes and textures.
 | 8 | Camera basis and orbit camera fixes (the base code mirrored the pitch and put the eye below the floor whenever a scene looked downwards) | `src/scene.cpp`, `src/main.cpp` |
 | 9 | Procedural shapes: a power-8 Mandelbulb and a Menger sponge, signed distance fields intersected by sphere tracing with a bounding sphere broad phase | `src/intersections.cu` |
 | 10 | Procedural textures: checker and marble, evaluated on the object space hit point so they work on any shape | `src/interactions.cu` |
+| 11 | Restartable rendering: the accumulation buffer and sample count are checkpointed to `<FILE>.ckpt` and picked up again on the next start | `src/pathtrace.cu`, `src/main.cpp` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -513,6 +514,137 @@ step), lower the Mandelbulb's iteration count for screen pixels where the shape 
 sub-pixel sized (a distance-based LOD), and precompute a small 3D texture of the
 field so that most steps are a texture fetch instead of eight iterations of
 trigonometry.
+
+### Restartable rendering
+
+A high quality render here runs for minutes (the cover is 3m55s, the procedural
+scene 14m32s) and a film quality one would run for hours, which is a long time to
+keep a laptop on. Restartable rendering makes that interruptible: the renderer
+writes its state to `<FILE>.ckpt` while it runs, and the next start of the same
+scene picks the samples up where they stopped.
+
+**What has to be saved is almost nothing, and that is worth stating precisely.**
+Everything else in the renderer is already stateless per iteration: the camera
+rays, the path array, the intersection buffer and the compaction scratch space are
+all rebuilt from the scene at the top of every iteration, and there is no
+acceleration structure to serialise (the scene is a flat list of primitives that
+`pathtraceInit` re-uploads). The durable state is exactly
+
+* the accumulation buffer - one `glm::vec3` of un-normalised radiance per pixel,
+* how many samples went into it,
+* a fingerprint of the scene those samples belong to.
+
+That is a 40 byte header plus `width * height * 12` bytes of payload - 7.3 MB at
+800x800:
+
+```cpp
+struct CheckpointHeader {
+    char magic[8];                 // "P3CKPT01"
+    unsigned long long sceneHash;  // FNV-1a over camera, resolution, depth, materials, geoms
+    int resolutionX, resolutionY;
+    int traceDepth;
+    int iterations;                // samples already accumulated
+    int headerBytes, reserved;
+};
+```
+
+The reason a resumed render is *the same* render and not a new one is the RNG
+seeding: every sample draws with `(iteration, pixelIndex, depth)`, not with
+whatever order the iterations happen in, so iteration 1209 gets exactly the same
+random numbers whether it is the 1209th iteration of a fresh process or the first
+one after a resume. The scene fingerprint is what keeps that honest: change the
+camera, the resolution, the depth or any material in the scene file and the
+checkpoint is rejected (`[checkpoint] ... belongs to a different scene, starting
+from scratch`), because samples of a different image must not be averaged into
+this one. Raising `ITERATIONS` *is* allowed, and is the intended way to extend a
+render: the total target is not part of the fingerprint.
+
+The behaviour is controlled by one optional scene field, `CHECKPOINT` (seconds,
+default 30, `0` disables the feature):
+
+* while rendering, a checkpoint is written every `CHECKPOINT` seconds;
+* `S` and `Esc` write one, next to the PNG they already save;
+* finishing a render deletes it - a finished render has nothing to resume;
+* the file is written as `<FILE>.ckpt.tmp` and then renamed, so a process killed in
+  the middle of a write can never replace a good checkpoint with a truncated one.
+
+```
+$ cis565_path_tracer scenes/cornell.json          # stop it whenever
+[checkpoint] writing cornell.ckpt every 30.0 s; stop and re-run the same scene to continue where it stopped
+[checkpoint] saved at 79 samples
+[checkpoint] saved at 170 samples
+^C
+$ cis565_path_tracer scenes/cornell.json          # same scene file
+[checkpoint] resumed cornell.ckpt at 1208 samples
+...
+Saved cornell.2026-09-20_20-33-43z.1458samp.png.
+[checkpoint] resume cost: 0.62 ms to read + upload
+```
+
+![](img/checkpoint-analysis.png)
+
+*Left: what one checkpoint costs at 800x800. Middle: stopping a 1458 sample render
+at 1208 samples and finishing it later. Right: the difference between the resumed
+image and the uninterrupted one - the whole point of the feature is that this
+panel is empty.*
+
+### Restartable rendering: cost
+
+**Correctness first**: the resumed image is bit-identical to the uninterrupted
+one. Interrupting a 400x400 render of `scenes/cornell.json` at 1208 samples,
+restarting it and letting it run to 1458 samples gives `max |difference| = 0` over
+all 160,000 pixels compared to a single 1458 sample render, and the two images
+agree on their mean radiance to three decimals. A second run interrupted at 1141
+samples and finished at 1291 also came out at exactly 0.
+
+**What a checkpoint costs.** The accumulation buffer has to come back over PCIe,
+which is the part a CPU renderer does not pay for at all, so it is the part worth
+measuring (800x800, 7.32 MB payload, one save per second, timed by the tracer
+itself around the copy and the write):
+
+| staging buffer | device -> host | bandwidth | to disk | per checkpoint |
+|---|---:|---:|---:|---:|
+| page-locked (`cudaHostAlloc` + async copy on a stream) | **0.66 ms** | **10.84 GB/s** | 4.52 ms | 5.2 ms |
+| pageable (`malloc` + blocking `cudaMemcpy`) | 0.94 ms | 7.64 GB/s | 4.55 ms | 5.5 ms |
+
+Pinning the staging buffer is worth 1.42x: with pageable memory the driver has to
+bounce the copy through a page-locked buffer of its own, which is exactly the copy
+this avoids. The disk write dominates either way, and at the default 30 s interval
+a checkpoint costs 5.2 ms / 30 s = **0.017%** of the wall clock; at the 1 s
+interval used for the table it is still only 0.4%.
+
+**A pass that comes with it.** The base code copied the whole accumulation buffer
+back to the host *after every iteration*, because `saveImage()` reads it from
+there - 7.32 MB per iteration at 800x800, on the default stream, so it serialised
+with the kernels rather than overlapping them. With a known save and checkpoint
+schedule that copy only has to happen when one of them is actually due, so
+`pathtrace()` no longer does it and `saveImage()` and the checkpointer pull the
+image down on demand. The same 7.32 MB transfer measures 0.94 ms through pageable
+memory, so the copy the renderer used to do 500 times during a 500 sample render
+cost **about 0.47 s, ~2.5% of a 19 s render** at this resolution. End to end that
+is inside this machine's ±10-15% run to run spread, so the honest statement is
+"removed a measured 0.47 s of transfer", not a wall clock difference - and it
+means the numbers reported earlier in this README (stream compaction, depth of
+field) were taken with that copy still in place, i.e. they are conservative.
+
+On a hypothetical CPU renderer the same feature is a `memcpy` of a buffer that is
+already in the process's own address space, so this is a case where the GPU
+version *suffers*: the accumulation buffer lives in device memory and every
+checkpoint costs a PCIe round trip that a CPU implementation simply does not have,
+and the resume path uploads it back. What makes it cheap anyway is the ratio - 7.3
+MB of I/O against 19 s of rendering, and 10.8 GB/s with pinned memory - so the tax
+stays below the noise floor instead of becoming a design constraint, while the same
+19 s of samples would take a CPU path tracer tens of minutes to produce.
+
+Ways to take it further: overlap the copy with the next iteration by double
+buffering (kick off the async copy into staging buffer A, render the next
+iteration, write A to disk while the next copy fills B - the pieces exist, only the
+ping-pong is missing); write the payload with `OVERLAPPED` file I/O so the 4.5 ms
+disk write stops blocking the render loop; compress the payload (fp16 halves it,
+but breaks the exact-resume property, so it belongs in a separate "approximate
+resume" mode); and on a multi-GPU machine, checkpoint into pinned memory and hand
+the buffer to a second device to continue there, which is the same mechanism as a
+single-device resume.
 
 ### Validation against the reference image
 
