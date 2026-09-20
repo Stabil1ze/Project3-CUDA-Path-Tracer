@@ -138,6 +138,11 @@ void Scene::loadFromJSON(const std::string& jsonName)
     state.iterations = cameraData["ITERATIONS"];
     state.traceDepth = cameraData["DEPTH"];
     state.imageName = cameraData["FILE"];
+
+    // Restartable rendering: how often the accumulated image is written to
+    // "<FILE>.ckpt" while the render runs, in seconds. 0 turns it off.
+    state.checkpointInterval = cameraData.value("CHECKPOINT", 30.0f);
+
     const auto& pos = cameraData["EYE"];
     const auto& lookat = cameraData["LOOKAT"];
     const auto& up = cameraData["UP"];

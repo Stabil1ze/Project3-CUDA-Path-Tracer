@@ -83,6 +83,10 @@ struct RenderState
     int traceDepth;
     std::vector<glm::vec3> image;
     std::string imageName;
+    // Restartable rendering: seconds between checkpoints while a render is in
+    // progress (0 disables it). A checkpoint that existed when the render
+    // started was already consumed by the resume in runCuda().
+    float checkpointInterval;
 };
 
 struct PathSegment

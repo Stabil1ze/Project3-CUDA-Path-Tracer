@@ -35,6 +35,8 @@ static double lastY;
 
 static bool camchanged = true;
 static float dtheta = 0, dphi = 0;
+// Restartable rendering: glfwGetTime() of the last checkpoint write.
+static double lastCheckpointTime = 0.0;
 static glm::vec3 cammove;
 
 float zoom, theta, phi;
@@ -395,6 +397,10 @@ int main(int argc, char** argv)
 
 void saveImage()
 {
+    // The accumulation buffer lives on the device; pull it down now instead of
+    // copying it after every iteration (see pathtraceFetchImage).
+    pathtraceFetchImage(scene);
+
     float samples = iteration;
     // output image file
     Image img(width, height);
@@ -451,6 +457,22 @@ void runCuda()
     {
         pathtraceFree();
         pathtraceInit(scene);
+
+        // Restartable rendering: pick up where the last run of this scene
+        // stopped. The checkpoint is validated against a fingerprint of the
+        // scene, so editing the scene file (or its resolution) starts over.
+        int resumedIterations = 0;
+        if (pathtraceLoadCheckpoint(scene, &resumedIterations))
+        {
+            iteration = resumedIterations;
+        }
+        else if (renderState->checkpointInterval > 0.0f)
+        {
+            printf("[checkpoint] writing %s.ckpt every %.1f s; stop and re-run the same "
+                "scene to continue where it stopped\n",
+                renderState->imageName.c_str(), renderState->checkpointInterval);
+        }
+        lastCheckpointTime = glfwGetTime();
     }
 
     if (iteration < renderState->iterations)
@@ -465,10 +487,33 @@ void runCuda()
 
         // unmap buffer object
         cudaGLUnmapBufferObject(pbo);
+
+        // Restartable rendering: write the accumulation buffer out every
+        // checkpointInterval seconds so that a render that takes hours survives
+        // a reboot (or the user pressing Ctrl-C). The interval is a scene field
+        // because it is really an I/O budget: 0 turns it off entirely.
+        const float interval = renderState->checkpointInterval;
+        if (interval > 0.0f && iteration < renderState->iterations)
+        {
+            const double now = glfwGetTime();
+            if (now - lastCheckpointTime >= interval)
+            {
+                if (pathtraceSaveCheckpoint(scene, iteration))
+                {
+                    printf("[checkpoint] saved at %d samples\n", iteration);
+                }
+                lastCheckpointTime = now;
+            }
+        }
     }
     else
     {
         saveImage();
+        // The render is finished, so there is nothing left to resume: drop the
+        // checkpoint instead of leaving a stale one that would make the next
+        // start skip straight to the end.
+        pathtraceDeleteCheckpoint(scene);
+        printCheckpointStats();
         pathtraceFree();
         cudaDeviceReset();
         exit(EXIT_SUCCESS);
@@ -487,10 +532,13 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         {
             case GLFW_KEY_ESCAPE:
                 saveImage();
+                pathtraceSaveCheckpoint(scene, iteration);
+                printCheckpointStats();
                 glfwSetWindowShouldClose(window, GL_TRUE);
                 break;
             case GLFW_KEY_S:
                 saveImage();
+                pathtraceSaveCheckpoint(scene, iteration);
                 break;
             case GLFW_KEY_SPACE:
                 camchanged = true;

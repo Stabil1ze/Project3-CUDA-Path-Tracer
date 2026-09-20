@@ -3,6 +3,10 @@
 #include <cstdio>
 #include <cuda.h>
 #include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <filesystem>
 #include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/remove.h>
@@ -34,6 +38,15 @@
 // which are copied back and printed at the end of the render. The atomics cost
 // a few percent, so set it to 0 when timing the scene.
 #define SDF_STATS 1
+
+// Restartable rendering: save the accumulated image plus the sample count to
+// "<FILE>.ckpt" while a render is in progress, and pick it up again on the next
+// start. CHECKPOINT_PINNED_MEMORY selects the staging buffer used to pull the
+// accumulation buffer off the device - page-locked memory lets the driver DMA
+// straight into it, pageable memory makes it bounce through a staging buffer of
+// its own. Its "0" is the "before" side of the measurement in the README.
+#define RESTARTABLE 1
+#define CHECKPOINT_PINNED_MEMORY 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -195,6 +208,174 @@ static void printSdfStats(int pixelcount)
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Restartable rendering - checkpoint file format and helpers
+// ---------------------------------------------------------------------------
+// Layout: a fixed header followed by the raw accumulation buffer (one glm::vec3
+// of un-normalised radiance per pixel, in the same pixel order as the kernel
+// writes it). Fixed size, no alignment surprises, no serialisation library.
+
+static const char CHECKPOINT_MAGIC[8] = { 'P', '3', 'C', 'K', 'P', 'T', '0', '1' };
+
+struct CheckpointHeader
+{
+    char magic[8];
+    unsigned long long sceneHash;   // identifies the scene the samples belong to
+    int resolutionX;
+    int resolutionY;
+    int traceDepth;
+    int iterations;                 // samples already accumulated
+    int headerBytes;                // guards against a format change
+    int reserved;
+};
+
+static float* h_checkpointStaging = NULL;
+static size_t h_checkpointStagingBytes = 0;
+static cudaStream_t checkpointStream = NULL;
+static int h_checkpointSaves = 0;
+static int h_checkpointLoads = 0;
+static double h_checkpointCopyMs = 0.0;
+static double h_checkpointWriteMs = 0.0;
+static double h_checkpointLoadMs = 0.0;
+static long long h_checkpointBytesWritten = 0;
+
+static std::string checkpointPath(const Scene* scene)
+{
+    return scene->state.imageName + ".ckpt";
+}
+
+static unsigned long long hashCheckpointBytes(unsigned long long hash, const void* data, size_t bytes)
+{
+    // FNV-1a, applied byte wise so that it does not depend on struct padding.
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < bytes; i++)
+    {
+        hash ^= (unsigned long long)p[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+/**
+ * Fingerprint of everything a sample depends on: the camera (position, frame,
+ * field of view, aperture, focus), the resolution, the depth, and the geometry
+ * and materials. Two runs only share a checkpoint if all of it matches, so
+ * editing the scene file - or just resizing it - starts from scratch instead of
+ * adding samples of a different image into the accumulation buffer.
+ */
+static unsigned long long checkpointSceneHash(const Scene* scene)
+{
+    unsigned long long hash = 1469598103934665603ull;
+    const RenderState& state = scene->state;
+    const Camera& cam = state.camera;
+
+    hash = hashCheckpointBytes(hash, &cam.position, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &cam.lookAt, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &cam.up, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &cam.fov, sizeof(glm::vec2));
+    hash = hashCheckpointBytes(hash, &cam.pixelLength, sizeof(glm::vec2));
+    hash = hashCheckpointBytes(hash, &cam.aperture, sizeof(float));
+    hash = hashCheckpointBytes(hash, &cam.focalDistance, sizeof(float));
+    hash = hashCheckpointBytes(hash, &cam.resolution, sizeof(glm::ivec2));
+    hash = hashCheckpointBytes(hash, &state.traceDepth, sizeof(int));
+
+    for (const Material& m : scene->materials)
+    {
+        hash = hashCheckpointBytes(hash, &m.color, sizeof(glm::vec3));
+        hash = hashCheckpointBytes(hash, &m.specular.exponent, sizeof(float));
+        hash = hashCheckpointBytes(hash, &m.specular.color, sizeof(glm::vec3));
+        hash = hashCheckpointBytes(hash, &m.hasReflective, sizeof(float));
+        hash = hashCheckpointBytes(hash, &m.hasRefractive, sizeof(float));
+        hash = hashCheckpointBytes(hash, &m.indexOfRefraction, sizeof(float));
+        hash = hashCheckpointBytes(hash, &m.emittance, sizeof(float));
+        hash = hashCheckpointBytes(hash, &m.textureType, sizeof(int));
+        hash = hashCheckpointBytes(hash, &m.textureScale, sizeof(float));
+    }
+    for (const Geom& g : scene->geoms)
+    {
+        hash = hashCheckpointBytes(hash, &g.type, sizeof(GeomType));
+        hash = hashCheckpointBytes(hash, &g.materialid, sizeof(int));
+        hash = hashCheckpointBytes(hash, &g.translation, sizeof(glm::vec3));
+        hash = hashCheckpointBytes(hash, &g.rotation, sizeof(glm::vec3));
+        hash = hashCheckpointBytes(hash, &g.scale, sizeof(glm::vec3));
+        hash = hashCheckpointBytes(hash, &g.transform, sizeof(glm::mat4));
+    }
+    return hash;
+}
+
+static void releaseCheckpointStaging()
+{
+    if (h_checkpointStaging != NULL)
+    {
+#if CHECKPOINT_PINNED_MEMORY
+        cudaFreeHost(h_checkpointStaging);
+#else
+        free(h_checkpointStaging);
+#endif
+        h_checkpointStaging = NULL;
+    }
+    h_checkpointStagingBytes = 0;
+    if (checkpointStream != NULL)
+    {
+        cudaStreamDestroy(checkpointStream);
+        checkpointStream = NULL;
+    }
+}
+
+// The staging buffer is allocated on first use and kept, so that a render that
+// checkpoints periodically does not pay an allocation per checkpoint.
+static bool ensureCheckpointStaging(size_t bytes)
+{
+    if (h_checkpointStaging != NULL && h_checkpointStagingBytes >= bytes)
+    {
+        return true;
+    }
+    releaseCheckpointStaging();
+
+#if CHECKPOINT_PINNED_MEMORY
+    if (cudaHostAlloc((void**)&h_checkpointStaging, bytes, cudaHostAllocDefault) != cudaSuccess)
+    {
+        h_checkpointStaging = NULL;
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaStreamCreate(&checkpointStream) != cudaSuccess)
+    {
+        cudaFreeHost(h_checkpointStaging);
+        h_checkpointStaging = NULL;
+        cudaGetLastError();
+        return false;
+    }
+#else
+    h_checkpointStaging = (float*)malloc(bytes);
+    if (h_checkpointStaging == NULL)
+    {
+        return false;
+    }
+#endif
+    h_checkpointStagingBytes = bytes;
+    return true;
+}
+
+// Pull the accumulation buffer off the device into the staging buffer. Pinned
+// memory + an async copy on a dedicated stream is the fast path; the pageable
+// path is a plain blocking cudaMemcpy, which is what the measurement in the
+// README compares against.
+static double downloadCheckpointImage(size_t bytes)
+{
+    auto start = std::chrono::steady_clock::now();
+#if CHECKPOINT_PINNED_MEMORY
+    cudaMemcpyAsync(h_checkpointStaging, dev_image, bytes, cudaMemcpyDeviceToHost,
+        checkpointStream);
+    cudaStreamSynchronize(checkpointStream);
+#else
+    cudaMemcpy(h_checkpointStaging, dev_image, bytes, cudaMemcpyDeviceToHost);
+#endif
+    checkCUDAError("checkpoint download");
+    auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
     guiData = imGuiData;
@@ -258,8 +439,207 @@ void pathtraceFree()
     cudaFree(dev_sdfHistogram);
     dev_sdfSteps = NULL;
     dev_sdfHistogram = NULL;
+    releaseCheckpointStaging();
 
     checkCUDAError("pathtraceFree");
+}
+
+// ---------------------------------------------------------------------------
+// Restartable rendering - public entry points (see pathtrace.h)
+// ---------------------------------------------------------------------------
+
+void pathtraceFetchImage(Scene* scene)
+{
+    if (dev_image == NULL)
+    {
+        return;
+    }
+    const int pixelcount = scene->state.camera.resolution.x * scene->state.camera.resolution.y;
+    cudaMemcpy(scene->state.image.data(), dev_image,
+        pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+    checkCUDAError("fetch image");
+}
+
+bool pathtraceSaveCheckpoint(Scene* scene, int iterationsDone)
+{
+#if RESTARTABLE
+    // CHECKPOINT 0 in the scene means "do not restart, I am watching this one".
+    if (scene->state.checkpointInterval <= 0.0f || dev_image == NULL || iterationsDone <= 0)
+    {
+        return false;
+    }
+
+    const Camera& cam = scene->state.camera;
+    const int pixelcount = cam.resolution.x * cam.resolution.y;
+    const size_t bytes = (size_t)pixelcount * sizeof(glm::vec3);
+    if (!ensureCheckpointStaging(bytes))
+    {
+        printf("[checkpoint] could not allocate a %.1f MB staging buffer\n", bytes / 1048576.0);
+        return false;
+    }
+
+    const double copyMs = downloadCheckpointImage(bytes);
+
+    CheckpointHeader header;
+    memset(&header, 0, sizeof(header));
+    memcpy(header.magic, CHECKPOINT_MAGIC, sizeof(header.magic));
+    header.sceneHash = checkpointSceneHash(scene);
+    header.resolutionX = cam.resolution.x;
+    header.resolutionY = cam.resolution.y;
+    header.traceDepth = scene->state.traceDepth;
+    header.iterations = iterationsDone;
+    header.headerBytes = (int)sizeof(CheckpointHeader);
+
+    const std::string path = checkpointPath(scene);
+    const std::string tempPath = path + ".tmp";
+
+    auto start = std::chrono::steady_clock::now();
+    FILE* file = fopen(tempPath.c_str(), "wb");
+    if (file == NULL)
+    {
+        printf("[checkpoint] cannot write %s\n", tempPath.c_str());
+        return false;
+    }
+    const bool wrote = fwrite(&header, sizeof(header), 1, file) == 1
+        && fwrite(h_checkpointStaging, 1, bytes, file) == bytes;
+    fclose(file);
+
+    // Swap the finished file in only after it is complete on disk: a checkpoint
+    // that is interrupted by a crash or a kill must never replace a good one with
+    // a truncated one.
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    ec.clear();
+    std::filesystem::rename(tempPath, path, ec);
+    auto end = std::chrono::steady_clock::now();
+
+    if (!wrote || ec)
+    {
+        printf("[checkpoint] failed to write %s\n", path.c_str());
+        return false;
+    }
+
+    h_checkpointSaves++;
+    h_checkpointCopyMs += copyMs;
+    h_checkpointWriteMs += std::chrono::duration<double, std::milli>(end - start).count();
+    h_checkpointBytesWritten += (long long)(sizeof(header) + bytes);
+    return true;
+#else
+    (void)scene;
+    (void)iterationsDone;
+    return false;
+#endif
+}
+
+bool pathtraceLoadCheckpoint(Scene* scene, int* iterationsDone)
+{
+#if RESTARTABLE
+    if (dev_image == NULL)
+    {
+        return false;
+    }
+
+    const std::string path = checkpointPath(scene);
+    FILE* file = fopen(path.c_str(), "rb");
+    if (file == NULL)
+    {
+        return false;
+    }
+
+    CheckpointHeader header;
+    if (fread(&header, sizeof(header), 1, file) != 1)
+    {
+        fclose(file);
+        return false;
+    }
+
+    const Camera& cam = scene->state.camera;
+    const int pixelcount = cam.resolution.x * cam.resolution.y;
+    const size_t bytes = (size_t)pixelcount * sizeof(glm::vec3);
+
+    const bool matches = memcmp(header.magic, CHECKPOINT_MAGIC, sizeof(header.magic)) == 0
+        && header.headerBytes == (int)sizeof(CheckpointHeader)
+        && header.sceneHash == checkpointSceneHash(scene)
+        && header.resolutionX == cam.resolution.x
+        && header.resolutionY == cam.resolution.y
+        && header.traceDepth == scene->state.traceDepth
+        && header.iterations > 0;
+    if (!matches)
+    {
+        fclose(file);
+        printf("[checkpoint] %s belongs to a different scene, starting from scratch\n",
+            path.c_str());
+        return false;
+    }
+
+    if (!ensureCheckpointStaging(bytes))
+    {
+        fclose(file);
+        return false;
+    }
+    // Time the whole restore path: read the payload into the pinned buffer and
+    // upload it to the device in one DMA.
+    auto start = std::chrono::steady_clock::now();
+    if (fread(h_checkpointStaging, 1, bytes, file) != bytes)
+    {
+        fclose(file);
+        printf("[checkpoint] %s is truncated, starting from scratch\n", path.c_str());
+        return false;
+    }
+    fclose(file);
+
+    cudaMemcpy(dev_image, h_checkpointStaging, bytes, cudaMemcpyHostToDevice);
+    checkCUDAError("checkpoint upload");
+    auto end = std::chrono::steady_clock::now();
+    h_checkpointLoadMs += std::chrono::duration<double, std::milli>(end - start).count();
+
+    h_checkpointLoads++;
+    if (iterationsDone != NULL)
+    {
+        *iterationsDone = header.iterations;
+    }
+    printf("[checkpoint] resumed %s at %d samples\n", path.c_str(), header.iterations);
+    return true;
+#else
+    (void)scene;
+    (void)iterationsDone;
+    return false;
+#endif
+}
+
+void pathtraceDeleteCheckpoint(Scene* scene)
+{
+    std::error_code ec;
+    std::filesystem::remove(checkpointPath(scene), ec);
+}
+
+void printCheckpointStats()
+{
+#if RESTARTABLE
+    if (h_checkpointSaves == 0 && h_checkpointLoads == 0)
+    {
+        return;
+    }
+    if (h_checkpointSaves > 0)
+    {
+        const double meanCopyMs = h_checkpointCopyMs / h_checkpointSaves;
+        const double meanWriteMs = h_checkpointWriteMs / h_checkpointSaves;
+        const double payloadMb = (double)(h_checkpointBytesWritten / h_checkpointSaves)
+            / 1048576.0;
+        printf("[checkpoint] %d saves, %d load(s), %.1f MB written; per save: %.2f ms "
+            "device->host (%.2f GB/s) + %.2f ms to disk (pinned staging = %d)\n",
+            h_checkpointSaves, h_checkpointLoads,
+            (double)h_checkpointBytesWritten / 1048576.0,
+            meanCopyMs,
+            meanCopyMs > 0.0 ? payloadMb / 1024.0 / (meanCopyMs / 1000.0) : 0.0,
+            meanWriteMs, CHECKPOINT_PINNED_MEMORY);
+    }
+    if (h_checkpointLoads > 0)
+    {
+        printf("[checkpoint] resume cost: %.2f ms to read + upload\n",
+            h_checkpointLoadMs / h_checkpointLoads);
+    }
+#endif
 }
 
 /**
@@ -807,9 +1187,12 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // Send results to OpenGL buffer for rendering
     sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
 
-    // Retrieve image from GPU
-    cudaMemcpy(hst_scene->state.image.data(), dev_image,
-        pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+    // NOTE: the base code copied the whole accumulation buffer back to the host
+    // here, after every single iteration, because saveImage() reads it from
+    // there. That is 7.7 MB of PCIe traffic per iteration at 800x800 for data
+    // that is only read when the user saves - or, now, when a checkpoint is due.
+    // The copy moved to pathtraceFetchImage(), which saveImage() and the
+    // checkpointer call on demand.
 
     checkCUDAError("pathtrace");
 }
