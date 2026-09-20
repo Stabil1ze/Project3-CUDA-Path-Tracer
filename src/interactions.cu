@@ -1,8 +1,17 @@
 #include "interactions.h"
 
 #include "utilities.h"
+#include "ggx.h"
 
 #include <thrust/random.h>
+
+// Glossy specular (ROUGHNESS > 0) sampling strategy, for the comparison in the
+// README: 1 samples the distribution of *visible* normals (Heitz 2018, keeps the
+// grazing angle samples useful), 0 samples the plain NDF (the classic formula,
+// which throws away samples whose half vector points below the surface).
+#ifndef GLOSSY_VNDF_SAMPLING
+#define GLOSSY_VNDF_SAMPLING 1
+#endif
 
 __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
     glm::vec3 normal,
@@ -144,15 +153,78 @@ __host__ __device__ void scatterRay(
     }
     else if (lobe < (diffuseWeight + specularWeight) / weightSum)
     {
-        // --- Perfect specular (mirror) ----------------------------------
-        // The reflected direction is the only direction with a non-zero pdf
-        // (the BSDF is a delta distribution), so BRDF*cos/pdf reduces to the
-        // reflectance itself.
-        // ROUGHNESS > 0 would jitter this direction; that is the "imperfect
-        // specular" extension (GPU Gems 3, Ch. 20), not implemented yet.
         const float probability = specularWeight / weightSum;
-        direction = glm::reflect(glm::normalize(pathSegment.ray.direction), normal);
-        weight = m.specular.color * (specularWeight / probability);
+        const glm::vec3 incident = glm::normalize(pathSegment.ray.direction);
+        const float roughness = glm::clamp(m.specular.exponent, 0.0f, 1.0f);
+
+        if (roughness <= 0.0f)
+        {
+            // --- Perfect specular (mirror) -------------------------------
+            // The reflected direction is the only direction with a non-zero pdf
+            // (the BSDF is a delta distribution), so BRDF*cos/pdf reduces to the
+            // reflectance itself.
+            direction = glm::reflect(incident, normal);
+            weight = m.specular.color * (specularWeight / probability);
+        }
+        else
+        {
+            // --- GGX microfacet specular (glossy, roughness > 0) ---------
+            // BRDF = F * D * G / (4 cos_i cos_o), sampled by importance sampling
+            // the distribution of *visible* normals (Heitz 2018). With a half
+            // vector h drawn from that distribution the pdf of the reflected
+            // direction is
+            //     pdf = D_vis(h) / (4 (wo . h)) = G1(wo) D(h) / (4 cos_o)
+            // so the estimator collapses to
+            //     BRDF * cos_i / pdf = F * G2 / G1(wo)
+            // which is why D never has to be evaluated in the result: it cancels.
+            // (F, and therefore the material colour, still carry the energy.)
+            const float alpha = ggxAlphaFromRoughness(roughness);
+            const glm::vec3 wo = -incident;          // toward the viewer
+            const float NdotV = glm::max(glm::dot(normal, wo), 1e-4f);
+
+#if GLOSSY_VNDF_SAMPLING
+            const glm::vec3 h = ggxSampleVisibleNormal(normal, wo, alpha, u01(rng), u01(rng));
+#else
+            const glm::vec3 h = ggxSampleNormal(normal, alpha, u01(rng), u01(rng));
+#endif
+            const glm::vec3 glossyDirection = glm::reflect(incident, h);
+            const float NdotL = glm::dot(normal, glossyDirection);
+            const float NdotH = glm::dot(normal, h);
+            const float VdotH = glm::dot(wo, h);
+
+            // Half vectors below the horizon (or light below the surface) carry
+            // no energy; with the visible normal distribution this is rare, with
+            // the classic NDF sampling it is common at grazing angles.
+            if (NdotL <= 0.0f || NdotH <= 0.0f || VdotH <= 0.0f)
+            {
+                pathSegment.color = glm::vec3(0.0f);
+                pathSegment.remainingBounces = -1;
+                return;
+            }
+
+            const glm::vec3 F = fresnelSchlick(m.specular.color, VdotH);
+            const float D = ggxDistribution(NdotH, alpha);
+            const float G2 = ggxG2HeightCorrelated(NdotV, NdotL, alpha);
+            const float G1o = ggxG1(NdotV, alpha);
+#if GLOSSY_VNDF_SAMPLING
+            // pdf of the visible normal distribution, converted to the solid
+            // angle of the reflected direction
+            const float pdf = G1o * D / (4.0f * NdotV);
+#else
+            // pdf of the plain NDF sampling
+            const float pdf = D * NdotH / (4.0f * VdotH);
+#endif
+            if (pdf <= 0.0f)
+            {
+                pathSegment.color = glm::vec3(0.0f);
+                pathSegment.remainingBounces = -1;
+                return;
+            }
+
+            const glm::vec3 f = F * (D * G2 / (4.0f * NdotV * NdotL));
+            direction = glossyDirection;
+            weight = f * (NdotL / pdf) * (specularWeight / probability);
+        }
     }
     else
     {
