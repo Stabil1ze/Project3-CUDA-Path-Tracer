@@ -20,7 +20,8 @@ one-bounce mirror reflections and soft shadowing. `scenes/showcase.json`,
 The CIS 5650 base code provides the framework - JSON scene loading, primitive
 intersections, the CUDA-OpenGL interop preview and image saving. Everything that
 turns it into a renderer is implemented here: the BSDF shading kernel, the
-bounce loop, anti-aliasing and stream compaction.
+bounce loop, anti-aliasing, stream compaction, a thin lens camera and the
+procedural shapes and textures.
 
 | # | Feature | File |
 |---|---|---|
@@ -32,6 +33,8 @@ bounce loop, anti-aliasing and stream compaction.
 | 6 | Per-bounce ray counting for the analysis (`[profile] ...` on stdout) | `src/pathtrace.cu` |
 | 7 | Physically based depth of field: thin lens camera driven by two optional scene fields (`APERTURE`, `FOCUS`), off by default | `src/pathtrace.cu`, `src/scene.cpp` |
 | 8 | Camera basis and orbit camera fixes (the base code mirrored the pitch and put the eye below the floor whenever a scene looked downwards) | `src/scene.cpp`, `src/main.cpp` |
+| 9 | Procedural shapes: a power-8 Mandelbulb and a Menger sponge, signed distance fields intersected by sphere tracing with a bounding sphere broad phase | `src/intersections.cu` |
+| 10 | Procedural textures: checker and marble, evaluated on the object space hit point so they work on any shape | `src/interactions.cu` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -255,6 +258,88 @@ exact no-ops for a level camera: the Cornell images in this README are
 bit-identical before and after the fix, and the cover image was re-rendered
 because `scenes/showcase.json` intentionally looks down.
 
+### Procedural shapes
+
+Two of the objects the scene format understands are not primitives but procedural
+shapes, defined as signed distance fields and intersected by sphere tracing: a
+power-8 **Mandelbulb** and a level-3 **Menger sponge**, both added as new
+`GeomType`s (`scenes/procedural.json` asks for them with `"TYPE": "Mandelbulb"` /
+`"TYPE": "Menger"`).
+
+Sphere tracing works because a signed distance field *lower bounds* the distance
+to the surface, so a step of that size can never tunnel through it. One property
+of the base code forces a correction here: the shape is evaluated in object space
+(where its field has Lipschitz constant 1) but marched in world space, and scaling
+the field by the object's largest scale factor turns it into a Lipschitz-s field -
+so every step has to be divided by that scale, otherwise a scaled-up fractal is
+stepped straight through.
+
+```cpp
+for (int i = 0; i < MAX_STEPS; i++) {
+    glm::vec3 pWorld = rayOrigin + t * rayDirection;
+    float d = sdfEvaluate(geom.type, multiplyMV(geom.inverseTransform, vec4(pWorld, 1)));
+    if (glm::abs(d) < HIT_EPSILON) { hit = true; break; }
+    t += glm::max(d * stepScale, HIT_EPSILON);   // stepScale = 1 / max scale
+}
+```
+
+* The surface normal comes from the gradient of the field, taken as four
+  evaluations arranged as the corners of a tetrahedron instead of the six a
+  per-axis central difference would need.
+* `MAX_STEPS = 128` and `HIT_EPSILON = 1e-4` bound the cost of a single test. A
+  ray that grazes the shape can spend all 128 steps and still report "no hit"
+  (see the histogram below) - the classic failure mode of sphere tracing, and the
+  reason the shapes are used as *scene decoration* rather than, say, as a
+  navmesh.
+* Before marching, the ray is tested against the shape's bounding sphere (radius
+  1.3 for the Mandelbulb, `sqrt(3)` for the Menger sponge, scaled by the object).
+  That is a pure rejection test - the march itself still starts at `t = 0` - so
+  `SDF_BOUNDING_SPHERE` can be flipped in `intersections.h` to measure the culling
+  without changing a single pixel of the image.
+
+Both shapes are fractal *distance estimates* rather than exact fields: the
+Mandelbulb's `0.5 log(r) r / dr` bound is a lower bound with a well known
+overestimate in the outer shell, which is why the marching needs the epsilon
+rather than an equality test, and why the surfaces are slightly "soft" compared to
+the analytic primitives.
+
+### Procedural textures
+
+Two procedural textures modulate the diffuse albedo: a 3D **checker board** and a
+**marble** pattern built from fractal value noise. Both are pure functions of the
+hit point - but of the hit point in *object space*, so the pattern is attached to
+the object, follows its transform, and needs no UV layout at all. That last part
+is what makes them usable on the SDF shapes above: there is no sane way to put a
+(u, v) parameterisation on a Mandelbulb, but "the point I hit, in the object's own
+coordinates" always exists.
+
+```cpp
+// checker: the parity of the lattice cell
+float cells = glm::floor(p.x) + glm::floor(p.y) + glm::floor(p.z);
+return glm::mix(vec3(1.0f), vec3(0.08f, 0.08f, 0.10f), glm::mod(cells, 2.0f));
+
+// marble: veins along a diagonal, wrung by 5 octaves of value noise
+float bands = sinf((p.x + 0.6f * p.y + 0.35f * p.z) * 3.0f + fractalNoise(p) * 6.0f);
+return glm::mix(vec3(0.34f), vec3(1.0f), bands * bands);
+```
+
+The value noise is trilinear interpolation of an integer hash (`xorshift`-style
+multiplies), and the fractal sum reuses it at five frequencies. The scene format
+gained two optional material fields, `TEXTURE` (`none` / `checker` / `marble`) and
+`TEXSCALE` (how many pattern cells fit into one object space unit).
+
+![](img/procedural-textures.png)
+
+*The same scene and the same camera, with both textures switched off and on.
+`scenes/procedural.json`, 400x400, 500 samples, cropped to the two shapes.*
+
+![](img/procedural.png)
+
+*`scenes/procedural.json` at 800x800, 3000 samples (14m32s): the marble
+Mandelbulb on the left, the checkered Menger sponge on the right, a mirror ball
+behind them. The grain that is left is Monte Carlo noise from the indirect
+bounces - the sphere tracing itself is deterministic.*
+
 ## Performance Analysis
 
 All numbers below: RTX 3060 Laptop, Release build, CUDA 13.3, MSVC 19.51, 800x800
@@ -351,6 +436,84 @@ precomputed low-discrepancy table (a concentric or Sobol disk) instead of
 anti-aliasing, two for the lens) into one stratified 4D sample so that the pixel
 area *and* the lens disk are jointly stratified instead of independently jittered.
 
+### Procedural shapes: cost, culling and divergence
+
+Sphere tracing is by far the most expensive thing in this project. The table below
+is `scenes/procedural.json` (the two fractals, the marble and the checker) against
+`scenes/procedural_analytic.json`, which is the *same scene* with a sphere and a
+cube in place of the two fractals, sized to the same bounding sphere / box. Same
+camera, same samples per pixel, medians of interleaved runs at 400x400 / 300 spp:
+
+| scene | render time | vs analytic |
+|---|---:|---:|
+| analytic primitives (sphere + cube) | 7.3 s | - |
+| SDF shapes, bounding sphere on | 25.4 s | **3.5x** |
+| SDF shapes, bounding sphere off | 31.1 s | 4.3x |
+
+Two things fall out of that:
+
+* **The shapes dominate the frame.** Every ray that tests a fractal pays 10-100
+  field evaluations, where the analytic scene pays a quadratic solve. Sphere
+  tracing buys an enormous amount of shape complexity for that price, but it is
+  not free, and it is why the fractals sit in an otherwise simple room.
+* **The bounding sphere culling is worth 1.22x**, and it is *free of side
+  effects*: because the sphere is only used to reject rays and does not move the
+  marching, enabling it leaves the image **bit-identical** (`max diff = 0` over
+  the 400x400, 300 spp render). The same scene with the toggle off is 22% slower
+  for no visual gain at all. Clipping the march to the sphere's entry point buys
+  another ~13% on top, but that *does* change the sample positions - and a 1e-4
+  change in the hit point is enough to decorrelate the noise of an 8-bounce path,
+  so the two images differ pixel by pixel while agreeing in the mean to 0.03% of
+  full scale. I kept the version that cannot be told apart from the baseline.
+
+The tracer counts its own marching steps (the `[sdf]` lines on stdout, gated by
+`SDF_STATS`), which is what the left panel below is made of. The counters are 64
+bit, which matters more than it sounds: a 800x800/3000spp render produces 5.3e9
+marches, and a 32 bit accumulator silently wraps that into a plausible looking
+number.
+
+![](img/sdf-analysis.png)
+
+*220M marches at an average of 68.9 steps per SDF test, on the 400x400 / 500 spp
+render. The last bucket is the interesting one: 29% of marches use the entire
+128 step budget and give up. Those are the near-miss rays and the rays that pass
+through the shell where the Mandelbulb's distance estimate is nearly zero.*
+
+That 29% tail is also the most GPU-specific part of the feature. A warp marches
+until every one of its 32 lanes is done, so lanes that finished in 20 steps sit
+idle while a neighbour grinds to 128; the bar chart's average of 68.9 steps is
+therefore a *lower* bound on what the hardware pays. On the CPU side the same
+field evaluations would be spread over a handful of cores, and the divergence
+would be hidden by out-of-order execution but paid with far lower throughput: a
+RTX 3060 Laptop issues ~10^12 simple ops/s, so the ~10^10 field evaluations of
+this 400x400 render take tens of seconds, where a CPU implementation of the same
+fractal (for example the Embree based path tracer I wrote for my CG2025 course)
+would need minutes for the same sample count. The feature *suffers* from the
+divergence on the GPU, but it suffers much less than it would from the CPU's
+throughput.
+
+The textures are essentially free: switching both of them off changes the 400x400
+render time by less than the ~5% run-to-run spread (25.4 s with, 25.2 s without;
+on the analytic scene, 7.3 s with, 7.8 s without). That is not surprising once the
+two costs are put side by side: the marble's 5 octaves of trilinear value noise
+are ~100 ALU operations *per shading event*, while a single SDF test is ~69
+marching steps of an 8-iteration Mandelbulb distance estimate, i.e. tens of
+thousands of operations - and textures are evaluated once per bounce rather than
+once per marching step. A file-backed texture with bilinear filtering and a bump
+map would cost a little more (texture cache traffic, mip selection), but the
+measurement here says the same thing the GPU literature does: procedural shading
+arithmetic is cheap next to the geometry.
+
+Ideas for further optimizing the shapes, in the order I would try them: march with
+a *cone* against a hierarchical set of bounding spheres instead of a single one
+(which prunes the tail properly rather than just the empty space), use the
+distance estimate to skip the sphere tracing entirely for shadow rays (shadow rays
+only need an occluded/not-occluded answer, so they can stop at the first small
+step), lower the Mandelbulb's iteration count for screen pixels where the shape is
+sub-pixel sized (a distance-based LOD), and precompute a small 3D texture of the
+field so that most steps are a texture fetch instead of eight iterations of
+trigonometry.
+
 ### Validation against the reference image
 
 `img/REFERENCE_cornell.5000samp.png` ships with the base code and my render
@@ -376,9 +539,12 @@ specular as a core feature, so the sphere reflects the room instead.
 | `scenes/cornell_closed.json` | the same box with a front wall and the camera moved inside, so no ray can escape - the closed case of the compaction analysis |
 | `scenes/showcase.json` | the cover image: a closed room, a 5x5 ceiling light, three mirror spheres and a diffuse ball |
 | `scenes/dof.json` | the depth of field scene: five mirrors receding from the camera, a near diffuse ball and `APERTURE` / `FOCUS` in the camera block |
+| `scenes/procedural.json` | the procedural shapes: a marble Mandelbulb and a checkered Menger sponge in a closed room, plus a mirror ball |
+| `scenes/procedural_analytic.json` | the same scene with a sphere and a cube sized to the fractals' bounds, for the "what does sphere tracing cost" comparison |
 
-No meshes or texture files are used, so nothing has to be downloaded to render
-them.
+No meshes or texture files are used - the textures are procedural, and the two
+complex shapes are distance fields - so nothing has to be downloaded to render
+any of them.
 
 ## CMakeLists.txt changes
 
@@ -411,6 +577,13 @@ uncommented to link my Project 2 implementation, and
   9.3 (specular reflection and transmission), GPU Gems 3, Ch. 20 for the specular
   sampling model, Paul Bourke's raytracing notes for anti-aliasing, and PBRT v4
   section 5.2.3 (the thin lens model) for the depth of field camera.
+* The procedural shapes follow the published distance estimators rather than any
+  particular implementation: the power-8 Mandelbulb distance estimate from White
+  and Nylander, *Mandelbulb: The Unravelling of the Real 3D Mandelbrot Fractal*
+  (2009), and the Menger sponge folding from Inigo Quilez's distance function
+  article ([iquilezles.org/articles/distfunctions](https://iquilezles.org/articles/distfunctions/)),
+  which is also where the tetrahedron normal trick and the value noise used by the
+  marble texture come from.
 * The code in this project was written with the help of AI agents (pair
   programming over the CUDA/C++ sources, the build fixes and this README), in line
   with the course's third-party code policy.
