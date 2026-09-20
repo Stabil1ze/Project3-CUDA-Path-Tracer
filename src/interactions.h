@@ -35,8 +35,12 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
  * - Pick the split based on the intensity of each material color, and divide
  *   branch result by that branch's probability (whatever probability you use).
  *
- * This method applies its changes to the Ray parameter `ray` in place.
- * It also modifies the color `color` of the ray in place.
+ * This method applies its changes to the PathSegment in place: it writes the
+ * scattered ray (origin + direction) and multiplies the running throughput
+ * `pathSegment.color` by the BSDF/pdf ratio of the branch that was taken.
+ *
+ * `intersect` is the world space hit point, `normal` the surface normal and
+ * `m` the material that was hit.
  *
  * You may need to change the parameter list for your purposes!
  */

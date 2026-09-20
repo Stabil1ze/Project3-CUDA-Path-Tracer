@@ -51,7 +51,68 @@ __host__ __device__ void scatterRay(
     const Material &m,
     thrust::default_random_engine &rng)
 {
-    // TODO: implement this.
-    // A basic implementation of pure-diffuse shading will just call the
-    // calculateRandomDirectionInHemisphere defined above.
+    // Keep the normal on the side the ray came from. The intersection tests
+    // already flip it when the ray starts inside a primitive, but a surface
+    // can still be hit while the normal points "away" (e.g. grazing hits on a
+    // transformed box), which would send the diffuse ray into the object.
+    if (glm::dot(normal, pathSegment.ray.direction) > 0.0f)
+    {
+        normal = -normal;
+    }
+
+    // --- Pick which BSDF lobe this bounce uses ---------------------------
+    // Each lobe is weighted by how much of the surface response it carries.
+    // The lobe is chosen probabilistically and its throughput is divided by the
+    // probability of having picked it, which keeps the estimator unbiased.
+    // Today the weights are 0/1 (a material is either diffuse or a mirror), so
+    // the sum is 1 and the division is a no-op - but the code stays correct for
+    // mixed materials such as glossy = diffuse + imperfect specular.
+    float diffuseWeight = (m.hasReflective > 0.0f) ? 0.0f : 1.0f;
+    float specularWeight = m.hasReflective;
+    float weightSum = diffuseWeight + specularWeight;
+    if (weightSum <= 0.0f)
+    {
+        // Material with no usable lobe: fall back to a black diffuser instead
+        // of producing NaNs.
+        diffuseWeight = 1.0f;
+        weightSum = 1.0f;
+    }
+
+    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+    glm::vec3 direction;
+    glm::vec3 weight;
+
+    if (u01(rng) < diffuseWeight / weightSum)
+    {
+        // --- Ideal diffuse (Lambertian) ---------------------------------
+        // Sample the outgoing direction from a cosine-weighted hemisphere;
+        // the cosine term and the pdf cancel exactly:
+        //     BRDF = albedo / PI,  pdf = cos(theta) / PI
+        //     throughput *= BRDF * cos(theta) / pdf = albedo
+        // which is why cosine-weighted sampling is both cheap and low variance.
+        const float probability = diffuseWeight / weightSum;
+        direction = calculateRandomDirectionInHemisphere(normal, rng);
+        weight = m.color * (diffuseWeight / probability);
+    }
+    else
+    {
+        // --- Perfect specular (mirror) ----------------------------------
+        // The reflected direction is the only direction with a non-zero pdf
+        // (the BSDF is a delta distribution), so BRDF*cos/pdf reduces to the
+        // reflectance itself.
+        // ROUGHNESS > 0 would jitter this direction; that is the "imperfect
+        // specular" extension (GPU Gems 3, Ch. 20), not implemented yet.
+        const float probability = specularWeight / weightSum;
+        direction = glm::reflect(glm::normalize(pathSegment.ray.direction), normal);
+        weight = m.specular.color * (specularWeight / probability);
+    }
+
+    pathSegment.ray.direction = glm::normalize(direction);
+    pathSegment.color *= weight;
+
+    // Spawn the next ray from the hit point, nudged off the surface. Without
+    // this the new ray can immediately re-intersect the surface it left
+    // (shadow acne) because of floating point error in `t`.
+    constexpr float RAY_EPSILON = 1e-3f;
+    pathSegment.ray.origin = intersect + normal * RAY_EPSILON;
 }

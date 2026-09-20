@@ -42,22 +42,29 @@ void Scene::loadFromJSON(const std::string& jsonName)
         const auto& name = item.key();
         const auto& p = item.value();
         Material newMaterial{};
-        // TODO: handle materials loading differently
+        const auto& col = p["RGB"];
+        newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+
+        // "TYPE" decides which BSDF lobe(s) the material has. The weight fields
+        // below are what scatterRay uses to probabilistically pick a lobe, so a
+        // material may combine several of them later on (e.g. glossy = diffuse
+        // + imperfect specular) without touching the tracing code.
         if (p["TYPE"] == "Diffuse")
         {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+            // albedo only: the random walk is chosen by scatterRay.
         }
         else if (p["TYPE"] == "Emitting")
         {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
             newMaterial.emittance = p["EMITTANCE"];
         }
         else if (p["TYPE"] == "Specular")
         {
-            const auto& col = p["RGB"];
-            newMaterial.color = glm::vec3(col[0], col[1], col[2]);
+            // Perfect mirror by default: ROUGHNESS 0 means the reflected
+            // direction is used as-is, a larger value is the hook for the
+            // "imperfect specular" extension (GPU Gems 3, Ch. 20).
+            newMaterial.hasReflective = 1.0f;
+            newMaterial.specular.color = newMaterial.color;
+            newMaterial.specular.exponent = p.value("ROUGHNESS", 0.0f);
         }
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
