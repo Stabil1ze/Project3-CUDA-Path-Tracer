@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sceneStructs.h"
+#include "sampling.h"
 
 #include <glm/glm.hpp>
 
@@ -14,6 +15,13 @@
 __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
     glm::vec3 normal, 
     thrust::default_random_engine& rng);
+
+/** Same, but with the two random numbers supplied by the caller (low
+ *  discrepancy samples instead of generator draws). */
+__host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
+    glm::vec3 normal,
+    float u1,
+    float u2);
 
 /**
  * Scatter a ray with some probabilities according to the material properties.

@@ -18,10 +18,17 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
     thrust::default_random_engine &rng)
 {
     thrust::uniform_real_distribution<float> u01(0, 1);
+    return calculateRandomDirectionInHemisphere(normal, u01(rng), u01(rng));
+}
 
-    float up = sqrt(u01(rng)); // cos(theta)
+__host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
+    glm::vec3 normal,
+    float u1,
+    float u2)
+{
+    float up = sqrt(u1); // cos(theta)
     float over = sqrt(1 - up * up); // sin(theta)
-    float around = u01(rng) * TWO_PI;
+    float around = u2 * TWO_PI;
 
     // Find a direction that is not the normal based off of whether or not the
     // normal's components are all equal to sqrt(1/3) or whether or not at
@@ -148,7 +155,7 @@ __host__ __device__ void scatterRay(
         //     throughput *= BRDF * cos(theta) / pdf = albedo
         // which is why cosine-weighted sampling is both cheap and low variance.
         const float probability = diffuseWeight / weightSum;
-        direction = calculateRandomDirectionInHemisphere(normal, rng);
+        direction = calculateRandomDirectionInHemisphere(normal, u01(rng), u01(rng));
         weight = m.color * (diffuseWeight / probability);
     }
     else if (lobe < (diffuseWeight + specularWeight) / weightSum)
