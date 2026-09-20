@@ -363,21 +363,22 @@ int main(int argc, char** argv)
     width = cam.resolution.x;
     height = cam.resolution.y;
 
-    glm::vec3 view = cam.view;
-    glm::vec3 up = cam.up;
-    glm::vec3 right = glm::cross(view, up);
-    up = glm::cross(right, view);
-
     cameraPosition = cam.position;
 
-    // compute phi (horizontal) and theta (vertical) relative 3D axis
-    // so, (0 0 1) is forward, (0 1 0) is up
-    glm::vec3 viewXZ = glm::vec3(view.x, 0.0f, view.z);
-    glm::vec3 viewZY = glm::vec3(0.0f, view.y, view.z);
-    phi = glm::acos(glm::dot(glm::normalize(viewXZ), glm::vec3(0, 0, -1)));
-    theta = glm::acos(glm::dot(glm::normalize(viewZY), glm::vec3(0, 1, 0)));
+    // The interactive camera is an orbit camera: runCuda() places the eye at
+    //
+    //   lookAt + zoom * (sin(phi) * sin(theta), cos(theta), cos(phi) * sin(theta))
+    //
+    // so the two angles and the distance have to be recovered from the
+    // eye/look-at pair of the scene file by inverting exactly that expression.
+    // Recovering theta from |view.y| instead of view.y silently mirrors the
+    // camera vertically whenever the scene looks downwards.
     ogLookAt = cam.lookAt;
-    zoom = glm::length(cam.position - ogLookAt);
+    glm::vec3 eyeOffset = cam.position - ogLookAt;
+    zoom = glm::length(eyeOffset);
+    glm::vec3 forward = -eyeOffset / zoom;   // unit vector eye -> look-at
+    theta = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
+    phi = glm::atan(-forward.x, -forward.z);
 
     // Initialize CUDA and GL components
     init();
@@ -431,7 +432,9 @@ void runCuda()
         cam.view = -glm::normalize(cameraPosition);
         glm::vec3 v = cam.view;
         glm::vec3 u = glm::vec3(0, 1, 0);//glm::normalize(cam.up);
-        glm::vec3 r = glm::cross(v, u);
+        // Orthonormal frame: a non-normalised `right` would shrink the
+        // horizontal field of view as soon as the camera is tilted.
+        glm::vec3 r = glm::normalize(glm::cross(v, u));
         cam.up = glm::cross(r, v);
         cam.right = r;
 
