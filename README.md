@@ -39,6 +39,7 @@ procedural shapes and textures.
 | 12 | Russian roulette: paths are killed with a probability that grows as their throughput shrinks, and the survivors are divided by the survival probability | `src/pathtrace.cu` |
 | 13 | Refraction: a smooth dielectric BSDF with Schlick Fresnel, total internal reflection and the radiance scaling of a refractive interface | `src/interactions.cu`, `src/scene.cpp` |
 | 14 | Glossy specular: a GGX microfacet lobe with Smith masking-shadowing and importance sampling of the visible normal distribution | `src/ggx.h`, `src/interactions.cu` |
+| 15 | Low-discrepancy sampling: a scrambled Halton sequence for the pixel area and the lens, kept off the path dimensions after measuring both | `src/sampling.h`, `src/pathtrace.cu` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -962,6 +963,82 @@ be radiometrically exact. The other obvious step is to stop choosing between the
 diffuse and specular lobes with a coin flip and instead sample both and weight
 them with multiple importance sampling, which is the next feature.
 
+### Better random number sequences
+
+Every sample in this renderer used to come from one hash seeded linear
+congruential generator, which is a perfectly good generator and a wasteful way to
+sample an integral: pure random points clump, and a clumped sample is a sample
+whose information is partly wasted. The pixel area and the lens (the two
+dimensions of the *camera* ray) are now sampled with a **scrambled Halton
+sequence** (`src/sampling.h`):
+
+$$
+x_d(i) = \mathrm{fract}\left(\Phi_{b_d}(i) + r(p, d)\right)
+$$
+
+where $$\Phi_{b_d}$$ is the radical inverse in the d-th prime base, i is the
+iteration and r is a Cranley-Patterson rotation hashed from the pixel and the
+dimension. The rotation is what decorrelates neighbouring pixels: without it every
+pixel would take the same pattern and the image would show structure instead of
+noise. The prime bases are what decorrelate the *coordinates* of a sample.
+
+Both of those are worth spelling out, because both were measured here rather than
+assumed:
+
+| attempt | what happened |
+|---|---|
+| base 2 for every dimension with an XOR of the index (the cheap "Sobol-like" shortcut) | each coordinate is stratified on its own but the **pair lies on a constant diagonal** - the sphere silhouette RMSE went to 11.8, six times *worse* than the random sampler it was supposed to beat |
+| the same dimensions shared by every bounce of a path | every bounce draws the same values, the bounces correlate and the image **darkens by 2%** |
+| same directions applied to the BSDF and the roulette as well | the 200 spp Cornell render got **three times worse** (RMSE 34.6 against 11.6) and visibly grainier |
+
+The last row is the one that decided the scope of this feature, and it is a known
+result rather than a bug: a Halton sequence is a low discrepancy *point set*, and
+its quality lives in a fixed, low dimensional projection. A path integral is the
+opposite - its effective dimension grows with every bounce, the number of
+dimensions a sample uses depends on where the path goes (a diffuse bounce spends
+three, a mirror one, a dielectric two), and the integrand is discontinuous at
+every silhouette. Handing that integral a deterministic sequence means the
+correlation between dimensions shows up as structure instead of averaging out,
+which is exactly what the grain in that render was. The sequence is therefore used
+where the integral is two (sometimes four) dimensional, smooth within the pixel
+area, and identical in shape for every sample: the camera ray.
+
+![](img/lds-antialiasing.png)
+
+*Error against a 4000 spp reference, magnified 15x, for the emissive sphere of
+`scenes/sphere.json`: random jitter on the left, scrambled Halton on the right.
+The bright pixels around the silhouette - the samples that landed badly - are gone,
+and the silhouette band RMSE drops from 2.16 to 1.40 gray levels (**-35%**); on the
+whole image it drops from 0.240 to 0.155.*
+
+The full path tracing scenes are deliberately **unchanged** by it, because their
+noise is dominated by the path dimensions which still use the generator: on the
+Cornell box at 200 spp the RMSE against the 5000 spp reference is 11.603 with
+random jitter and 11.608 with the sequence, and the bias is -0.004 in both. That
+is the honest summary of this feature: a 35% error reduction on the integral the
+sequence fits, and nothing anywhere else.
+
+**Cost**: the radical inverse is a short loop of integer divisions (the bases go up
+to 311, so an index below 2^32 needs about five digits) plus one hash - four
+draws per camera ray, per iteration. Measured 3.76 s against 3.70 s on the sphere
+scene (+1.6%) and 6.9 s against 7.1 s on the Cornell box (inside the noise), i.e.
+under 2% for a 35% error reduction on edges. `LOW_DISCREPANCY_SAMPLING` in
+`sampling.h` turns it off for a direct comparison.
+
+On a hypothetical CPU renderer the same arithmetic costs the same per sample and
+the same argument applies; what a CPU packet tracer gains is that neighbouring
+rays *could* share a coherent low-discrepancy block (one sequence per packet), an
+idea that does not map onto a GPU where a warp's lanes belong to different pixels
+and each needs its own scrambled sequence.
+
+Further: an **Owen scrambled Sobol** sequence (proper digit-wise permutation
+instead of a rotation) with a *padded* dimension budget - always consuming the
+same dimensions per bounce regardless of which BSDF was hit - is the version that
+would let the path dimensions use it too; that is the standard fix for exactly the
+failure measured above. Correlated multi-jittered sampling (Kensler 2013) is the
+stronger alternative for the pixel area specifically, since it also gives blue
+noise like structure to the remaining error.
+
 ### Validation against the reference image
 
 `img/REFERENCE_cornell.5000samp.png` ships with the base code and my render
@@ -1038,6 +1115,11 @@ uncommented to link my Project 2 implementation, and
   `ggx_utils.hpp` came from a third party repository, which the course rules
   would require me to get approved and credit. The two are the same published
   algorithm, but this one is written here from the papers.
+* The sampler follows Halton (1960) for the radical inverse and Cranley &
+  Patterson (1976) for the rotation that decorrelates the pixels; the framing of
+  "which integrals a low-discrepancy sequence actually helps" is from the
+  [CSE 168 random sampling notes](https://cseweb.ucsd.edu/classes/sp17/cse168-a/CSE168_07_Random.pdf)
+  linked from the project instructions.
 * The procedural shapes follow the published distance estimators rather than any
   particular implementation: the power-8 Mandelbulb distance estimate from White
   and Nylander, *Mandelbulb: The Unravelling of the Real 3D Mandelbrot Fractal*
