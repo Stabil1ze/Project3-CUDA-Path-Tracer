@@ -36,6 +36,8 @@ procedural shapes and textures.
 | 9 | Procedural shapes: a power-8 Mandelbulb and a Menger sponge, signed distance fields intersected by sphere tracing with a bounding sphere broad phase | `src/intersections.cu` |
 | 10 | Procedural textures: checker and marble, evaluated on the object space hit point so they work on any shape | `src/interactions.cu` |
 | 11 | Restartable rendering: the accumulation buffer and sample count are checkpointed to `<FILE>.ckpt` and picked up again on the next start | `src/pathtrace.cu`, `src/main.cpp` |
+| 12 | Russian roulette: paths are killed with a probability that grows as their throughput shrinks, and the survivors are divided by the survival probability | `src/pathtrace.cu` |
+| 13 | Refraction: a smooth dielectric BSDF with Schlick Fresnel, total internal reflection and the radiance scaling of a refractive interface | `src/interactions.cu`, `src/scene.cpp` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -646,6 +648,219 @@ resume" mode); and on a multi-GPU machine, checkpoint into pinned memory and han
 the buffer to a second device to continue there, which is the same mechanism as a
 single-device resume.
 
+### Russian roulette
+
+The bounce loop has a hard budget (`DEPTH`), which is wasteful: a path that has
+bounced off three white walls carries almost the same radiance as one that has
+bounced off six, but both cost a full intersection and shading pass per bounce.
+Russian roulette gives every path a *survival probability* after a few bounces and
+divides the survivors' weight by it, which is exact in expectation:
+
+$$
+\mathbb{E}\left[\text{survive? } \frac{\text{throughput}}{p} : 0\right]
+= p \cdot \frac{\text{throughput}}{p} = \text{throughput}
+$$
+
+```cpp
+if (depth >= RR_MIN_DEPTH) {
+    const float survival = glm::clamp(maxComponent(pathSegment.color), 0.05f, 1.0f);
+    if (rrU01(rng) >= survival) {          // kill: loses nothing on average
+        pathSegment.color = glm::vec3(0.0f);
+        pathSegment.remainingBounces = -1; // <- the predicate stream compaction removes
+        return;
+    }
+    pathSegment.color /= survival;         // survivors carry the weight of the dead
+}
+```
+
+* It is the colour dependent version of the roulette the BSDF lobes already use
+  (a lobe is picked with a probability and its weight divided by it); here the
+  probability is the throughput instead of a lobe weight.
+* `maxComponent(throughput)` is the standard choice (PBRT v4 13.7): a path that
+  has lost 90% of its weight is 90% likely to die, one that is still bright
+  almost always survives.
+* The 0.05 floor keeps a path that has become very dim alive 5% of the time
+  instead of killing it outright - a pure variance/throughput trade-off.
+* Killed paths are marked with `remainingBounces = -1`, which is exactly the
+  predicate the stream compaction from the first part of this README removes
+  paths with, so the two features cooperate without extra plumbing: roulette
+  decides *that* a path is worthless, compaction *stops launching threads* for it.
+* `RUSSIAN_ROULETTE`, `RR_MIN_DEPTH` (3 segments, i.e. after two bounces) and
+  `RR_MIN_SURVIVAL` (0.05) are `#define`s in `pathtrace.cu`, so the feature has a
+  clean before/after switch.
+
+The tracer counts its own roulette decisions (`[rr]` on stdout):
+
+| scene | decisions per camera ray | killed | mean survival probability |
+|---|---:|---:|---:|
+| Cornell box, open, 8 bounces | 313.7 | 25.5% | 0.745 |
+| closed box, 8 bounces | 1507.8 | 18.5% | 0.815 |
+| closed box, 16 bounces | 2356.1 | 16.7% | 0.833 |
+| glass box, 12 bounces | 2907.1 | **51.2%** | 0.488 |
+
+The kill rate and the mean survival probability are two views of the same number
+(they have to sum to 1), which is a useful self-check on the instrumentation - and
+one that caught a bug in it: summing the survival probabilities into a single
+`float` accumulator silently stops working once the total passes $$2^{24}$$,
+because from there on an increment of ~0.7 is smaller than one ulp of the
+accumulator. The counter is accumulated in fixed point (thousandths) now. The
+glass row is the interesting one and is discussed under refraction below: a
+refractive interface *compresses* the path weight, so roulette sees the inside of
+glass as unimportant and kills half of what gets in there.
+
+### Russian roulette: cost and bias
+
+**Work** comes straight out of the per-bounce profile, so it has no timing noise
+in it: summing the surviving paths over the bounces gives the number of path
+segments a sample costs (800x800, 500 spp, `DEPTH` inside the labels):
+
+| scene | segments/sample, RR off | RR on | work removed | wall clock off -> on | |
+|---|---:|---:|---:|---:|---:|
+| Cornell box, open, 8 bounces | 302 | 240 | 20% | 21.5 s -> 17.8 s | **1.21x** |
+| closed box, 8 bounces | 751 | 540 | 28% | 41.9 s -> 30.0 s | **1.40x** |
+| closed box, 16 bounces | 1406 | 686 | **51%** | 87.0 s -> 45.5 s | **1.91x** |
+| glass box, 12 bounces | 1115 | 384 | **66%** | 24.8 s -> 12.8 s | **1.94x** |
+
+That is the shape the instruction asks about: the tie is a laser. As the depth
+budget grows, the fraction of the work that lives in the tail grows with it, and
+roulette removes nearly all of the tail; the deeper you can afford to trace the
+more roulette pays. It also means roulette is what makes a large `DEPTH` usable at
+all - a 16 bounce render costs less with roulette on than an 8 bounce render
+costs without it.
+
+**Bias** is the part that has to be proven, not asserted. Same scene, same seed
+structure, against a converged 5000 sample render of the open Cornell box that
+predates this feature:
+
+| measurement | RR off, 500 spp | RR on, 500 spp |
+|---|---:|---:|
+| mean image radiance, relative to the 5000 spp render | +0.013% | +0.013% |
+| RMSE against the 5000 spp render | 6.73 | 7.13 |
+| mean of (RR on - RR off) | -0.0003 (per channel 0.000) | |
+
+The means agree to three decimals with each other *and* with the reference, i.e.
+there is no detectable DC shift, while the per-pixel error grows by 6% - the
+variance the roulette is expected to add. Cheaper and unbiased, which is the
+whole point.
+
+![](img/rr-analysis.png)
+
+*Left: what roulette does to the tail (closed box, 16 bounces). Middle: work per
+sample from the profile. Right: wall clock.*
+
+The extra variance is not concentrated in the refraction: at the same sample count
+the RR on/off glass renders differ by 6.9 gray levels inside the glass ball and
+6.7 on the walls (signals of 92 and 110), i.e. roulette is not making the glass
+specifically noisier.
+
+**On the GPU** the payoff of killing a path is a little indirect: a thread whose
+path died stops immediately, but its warp still runs until the slowest lane is
+done, so the saving is realized through *stream compaction* - the killed paths
+leave the arrays, and the next bounce launches proportionally fewer warps. On a
+CPU path tracer the same kill is a `continue` in a loop over rays, with no
+divergence penalty at all, so roulette's saving is if anything cleaner there; what
+the GPU adds is that it can afford the deep budgets where roulette matters most.
+Both are far better off than the alternative of raising `DEPTH` and paying for
+every path.
+
+Further: an adaptive floor (dark scenes can tolerate a much smaller clamp than
+0.05), using roulette to replace the hard depth cap entirely so long as the
+estimator stays unbiased, basing the decision on a *separate* weight that ignores
+the refraction compression (see below), and path *splitting* in dark regions -
+the mirror image of roulette, which reduces variance instead of increasing it.
+
+### Refraction and Fresnel
+
+A dielectric surface has exactly two outgoing delta directions, the mirror
+direction and the refracted one. They are chosen with the Fresnel probability, so
+the estimator stays unbiased for every angle and index of refraction:
+
+```cpp
+const float etaI = entering ? 1.0f : m.indexOfRefraction;
+const float etaT = entering ? m.indexOfRefraction : 1.0f;
+const float fresnel = fresnelDielectricSchlick(cosThetaI, etaI, etaT);
+
+if (u01(rng) < fresnel) {                                   // reflect, prob F
+    direction = glm::reflect(incident, n);
+    weight    = m.color * (dielectricWeight / probability);
+} else {                                                    // transmit, prob 1-F
+    direction = glm::normalize(glm::refract(incident, n, etaI / etaT));
+    weight    = m.color * radianceScale * (dielectricWeight / probability);
+}
+```
+
+* The Fresnel term is Schlick's approximation with the cosine of the
+  *transmitted* angle, `F = F0 + (1 - F0)(1 - cos(theta_t))^5`, which stays
+  accurate for indices of refraction far from 1.5 (PBRT v3 8.2.3). When Snell's
+  law has no solution the interface is in **total internal reflection** and `F`
+  is 1, so the transmit branch is never taken and the bright rim a glass ball
+  shows at grazing angles falls out of the maths rather than being special cased.
+* `radianceScale` is `(etaI / etaT)^2`, the factor that makes the radiance of a
+  path consistent when it enters a denser medium. It matters for paths that end
+  *inside* the medium (depth budget or roulette) - see the roulette table above,
+  where entering glass drops the path weight to 0.44 and therefore drops its
+  survival probability with it.
+* The base code's intersection tests already knew whether a ray started inside a
+  primitive, but threw that away; `ShadeableIntersection` now carries an `outside`
+  flag, which is what lets the BSDF swap `etaI`/`etaT` and reconstruct the
+  geometric (outward) normal from the ray-oriented one the tests return.
+
+A dielectric also exposed a bug in my own ray spawning: the hit point is nudged
+along the normal to avoid self intersection, and the nudge has to follow the
+*new* ray's side. A transmitted ray goes into the medium, so nudging it back out
+along the incident side traps it inside the surface - which showed up as a
+path tracer that suddenly could not render a mirror correctly, because every
+bounce was re-hitting the surface it left. The nudge now uses the outward normal
+oriented against the new direction, which is identical to the old behaviour for
+reflection and diffuse bounces and correct for transmission.
+
+`scenes/glass.json` puts a glass sphere (IOR 1.5), a water sphere (1.33) and a
+mirror sphere in the same closed room, and the camera block runs at 12 bounces:
+
+![](img/glass-ior-sweep.png)
+
+*The same scene with the index of refraction swept. IOR 1.0 is the unit test
+worth staring at: `F0 = 0` and Snell's law is the identity, so the dielectric
+becomes an invisible surface and the big sphere vanishes completely (the faint
+blue ball in front is the water sphere, whose slightly blue material colour still
+tints what it transmits). From there, rising IOR bends the image of the room
+harder, brightens the Fresnel rim, and by 2.4 (diamond) the sphere is mostly a
+mirror with a small, heavily distorted window into the room behind it.*
+
+![](img/glass.png)
+
+*`scenes/glass.json` at 800x800, 1600 samples: the glass ball refracts the teal
+wall and the light into a bright focus on the floor, the water ball in front does
+the same with a blue tint, and the mirror ball on the right reflects the room.*
+
+Across the four indices of refraction the mean image radiance only moves from
+105.1 to 102.0 gray levels (3%), which is the expected loss to the extra internal
+Fresnel reflections and paths cut off by the depth budget - a missing or wrong
+`(etaI/etaT)^2` factor shows up as a much larger shift when a path can end inside
+the medium. The factor itself has a compile-time toggle
+(`REFRACTION_RADIANCE_SCALING`) so that it can be flipped and measured.
+
+**What refraction costs** is not the BSDF: replacing both dielectric spheres with
+diffuse spheres of the same size (same scene, same camera, same sample count)
+runs in 14.60 s against 14.34 s for the glass - within the noise of two runs each,
+and if anything the glass is the cheaper one, because the same 3 random numbers
+and one `glm::refract` replace the diffuse hemisphere sampling while the paths
+that get trapped in the glass are killed by roulette. What glass does cost is
+*bounces*: at 12 bounces the glass box needs 1115 path segments per sample with
+roulette off, and roulette removes 66% of them (the largest reduction of any
+scene here), so the two features fit together - glass wants depth, and roulette is
+what makes depth affordable. On a hypothetical CPU renderer the same division of
+labour holds; the GPU's version of "the paths diverge" is that a warp containing a
+ray that entered the glass runs as long as that ray does, which is exactly the
+case stream compaction and roulette exist to keep small.
+
+The natural next step for the dielectric is a *rough* one - a microfacet
+transmission model (GGX) instead of a perfect mirror/refract pair, which is the
+last item of this section, plus tracking the nesting depth of the medium for two
+payoffs: Beer-Lambert absorption for tinted glass, and skipping roulette while a
+path is inside a refractive object so that the inside of glass is not rouletted
+so aggressively.
+
 ### Validation against the reference image
 
 `img/REFERENCE_cornell.5000samp.png` ships with the base code and my render
@@ -673,6 +888,8 @@ specular as a core feature, so the sphere reflects the room instead.
 | `scenes/dof.json` | the depth of field scene: five mirrors receding from the camera, a near diffuse ball and `APERTURE` / `FOCUS` in the camera block |
 | `scenes/procedural.json` | the procedural shapes: a marble Mandelbulb and a checkered Menger sponge in a closed room, plus a mirror ball |
 | `scenes/procedural_analytic.json` | the same scene with a sphere and a cube sized to the fractals' bounds, for the "what does sphere tracing cost" comparison |
+| `scenes/cornell_closed_deep.json` | the closed box with `DEPTH` 16, the scene where Russian roulette saves the most |
+| `scenes/glass.json` | the dielectric scene: a glass sphere (IOR 1.5), a water sphere (1.33) and a mirror sphere in the closed room |
 
 No meshes or texture files are used - the textures are procedural, and the two
 complex shapes are distance fields - so nothing has to be downloaded to render
@@ -708,7 +925,9 @@ uncommented to link my Project 2 implementation, and
 * References used for the shading: PBRT v4 sections 9.2 (diffuse reflection) and
   9.3 (specular reflection and transmission), GPU Gems 3, Ch. 20 for the specular
   sampling model, Paul Bourke's raytracing notes for anti-aliasing, and PBRT v4
-  section 5.2.3 (the thin lens model) for the depth of field camera.
+  section 5.2.3 (the thin lens model) for the depth of field camera. The
+  dielectric BSDF and the `(etaI/etaT)^2` radiance scaling follow PBRT v3 8.2.3,
+  and the throughput based Russian roulette follows PBRT v4 13.7.
 * The procedural shapes follow the published distance estimators rather than any
   particular implementation: the power-8 Mandelbulb distance estimate from White
   and Nylander, *Mandelbulb: The Unravelling of the Real 3D Mandelbrot Fractal*
