@@ -38,6 +38,7 @@ procedural shapes and textures.
 | 11 | Restartable rendering: the accumulation buffer and sample count are checkpointed to `<FILE>.ckpt` and picked up again on the next start | `src/pathtrace.cu`, `src/main.cpp` |
 | 12 | Russian roulette: paths are killed with a probability that grows as their throughput shrinks, and the survivors are divided by the survival probability | `src/pathtrace.cu` |
 | 13 | Refraction: a smooth dielectric BSDF with Schlick Fresnel, total internal reflection and the radiance scaling of a refractive interface | `src/interactions.cu`, `src/scene.cpp` |
+| 14 | Glossy specular: a GGX microfacet lobe with Smith masking-shadowing and importance sampling of the visible normal distribution | `src/ggx.h`, `src/interactions.cu` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -861,6 +862,106 @@ payoffs: Beer-Lambert absorption for tinted glass, and skipping roulette while a
 path is inside a refractive object so that the inside of glass is not rouletted
 so aggressively.
 
+### GGX microfacet specular
+
+`ROUGHNESS` was parsed from the scene files from the start but never used: every
+`Specular` material was a perfect mirror. It now selects a **GGX
+(Trowbridge-Reitz) microfacet lobe**, with `alpha = roughness^2` (the Disney/PBRT
+mapping, so that the middle of the slider looks like a surface in the middle of
+glossy and matte) and the height correlated Smith masking-shadowing function:
+
+$$
+f(\omega_o,\omega_i) = \frac{F(\omega_o\cdot h)\, D(h)\, G_2(\omega_o,\omega_i)}
+{4\,(\omega_o\cdot n)(\omega_i\cdot n)}
+$$
+
+Two things have to line up for the lobe to be *sampled* correctly, and they are
+the actual content of "importance sampling" here:
+
+* **Sample the distribution of visible normals, not the NDF** (Heitz 2018). With
+  a half vector `h` drawn from the visible normal distribution the pdf of the
+  reflected direction is
+
+$$
+p(\omega_i) = \frac{D_{\text{vis}}(\omega_o,h)}{4(\omega_o\cdot h)}
+= \frac{G_1(\omega_o)\,D(h)}{4(\omega_o\cdot n)}
+$$
+
+  which collapses the estimator to `BRDF * cos / pdf = F * G2 / G1(wo)` - the
+  normal distribution `D` cancels completely, which is why the code computes it
+  but never needs it in the result. The plain NDF formula samples half vectors
+  that point below the surface at grazing angles and throws those samples away.
+
+```cpp
+const float alpha = ggxAlphaFromRoughness(roughness);
+const glm::vec3 wo = -incident;                       // toward the viewer
+const float NdotV = glm::max(glm::dot(normal, wo), 1e-4f);
+const glm::vec3 h  = ggxSampleVisibleNormal(normal, wo, alpha, u01(rng), u01(rng));
+const glm::vec3 wi = glm::reflect(incident, h);
+// ...
+const float D   = ggxDistribution(NdotH, alpha);
+const float G2  = ggxG2HeightCorrelated(NdotV, NdotL, alpha);
+const float G1o = ggxG1(NdotV, alpha);
+const float pdf = G1o * D / (4.0f * NdotV);           // = D_vis / (4 wo.h)
+weight = F * (D * G2 / (4.0f * NdotV * NdotL)) * (NdotL / pdf);
+```
+
+* The **height correlated** Smith `G2` (Heitz 2014) rather than the separable
+  product `G1(wo)G1(wi)`: the separable form darkens rough surfaces at grazing
+  angles, which makes rough metal look like rough metal that has been dipped in
+  soot. With the correlated form the `G2/G1` ratio in the weight is still the
+  correct one because the same `G2` sits in the BRDF.
+
+`scenes/glossy.json` is a row of five copper spheres stepping through
+`ROUGHNESS` 0.0, 0.08, 0.2, 0.4, 0.7, with a gold sphere and a glass sphere in
+front:
+
+![](img/glossy-roughness.png)
+
+*The same five spheres, cropped: from a mirror that reflects the room to a
+surface that has lost the reflection but kept the metal's colour. Note that only
+the highlight's **shape** changes with roughness - the reflected radiance is
+still the room, which is what makes this lobe energy conserving.*
+
+![](img/glossy.png)
+
+*`scenes/glossy.json` at 800x800, 2000 samples (2m24s).*
+
+**Sampling strategy.** `GLOSSY_VNDF_SAMPLING` switches between the visible normal
+distribution and the classic NDF formula, so the claim can be tested rather than
+believed. On this scene the two are statistically indistinguishable: mean image
+radiance 92.67 against 92.60 (0.08%), and the difference image is noise
+(RMS 10 gray levels at 800 samples). That is the honest result, and it has a
+specific reason - the sphere row is lit from above and seen from roughly its
+equator, so the grazing angles where the NDF formula starts wasting samples cover
+a thin band of pixels. The failure it prevents is real but geometric: aim a
+camera along a rough surface (a floor seen at the horizon) and the NDF sampler
+spends its samples on half vectors below the surface, which either biases the
+image dark (if they are dropped) or produces fireflies (if they are kept with a
+clamped pdf). Importance sampling the *visible* normals is the version that is
+correct by construction, so that is what the default build uses.
+
+![](img/glossy-sampling.png)
+
+**Cost.** The lobe itself is free. The same scene with all five roughness values
+set to 0 (a pure mirror) renders in 12.1 s against 12.2 s for the GGX version
+(400x400, 600 spp, 2 runs each) - two extra random numbers, a square root and a
+handful of dot products, next to an intersection test that walks a linear list of
+primitives. What roughness *does* change is the **rays**: a rough surface spreads
+the outgoing directions, so neighbouring pixels no longer share a narrow bundle
+and the intersection loop's memory access becomes less coherent. That is a
+GPU specific cost (a CPU renderer with the same code sees the same statistics but
+no warp); it is also exactly why the importance sampling is worth having, since
+the alternative to a well sampled lobe is more samples.
+
+Further: the single scattering Smith model loses energy at high roughness (light
+that should bounce a second time inside the microsurface is simply lost), which is
+usually fixed with the multiple-scattering compensation of Fdez-Aguero 2019 -
+worth doing before this lobe is used at `roughness > 0.6` in a scene that has to
+be radiometrically exact. The other obvious step is to stop choosing between the
+diffuse and specular lobes with a coin flip and instead sample both and weight
+them with multiple importance sampling, which is the next feature.
+
 ### Validation against the reference image
 
 `img/REFERENCE_cornell.5000samp.png` ships with the base code and my render
@@ -890,6 +991,7 @@ specular as a core feature, so the sphere reflects the room instead.
 | `scenes/procedural_analytic.json` | the same scene with a sphere and a cube sized to the fractals' bounds, for the "what does sphere tracing cost" comparison |
 | `scenes/cornell_closed_deep.json` | the closed box with `DEPTH` 16, the scene where Russian roulette saves the most |
 | `scenes/glass.json` | the dielectric scene: a glass sphere (IOR 1.5), a water sphere (1.33) and a mirror sphere in the closed room |
+| `scenes/glossy.json` | the GGX roughness sweep: five copper spheres from a mirror to `ROUGHNESS` 0.7, plus a gold and a glass sphere |
 
 No meshes or texture files are used - the textures are procedural, and the two
 complex shapes are distance fields - so nothing has to be downloaded to render
@@ -928,6 +1030,14 @@ uncommented to link my Project 2 implementation, and
   section 5.2.3 (the thin lens model) for the depth of field camera. The
   dielectric BSDF and the `(etaI/etaT)^2` radiance scaling follow PBRT v3 8.2.3,
   and the throughput based Russian roulette follows PBRT v4 13.7.
+* The GGX lobe in `src/ggx.h` is written from the published formulas - the
+  distribution and Smith masking from Walter et al. 2007 / PBRT v3 8.4, the height
+  correlated masking from Heitz 2014, and visible normal sampling from Heitz,
+  *Sampling the GGX Distribution of Visible Normals* (JCGT 2018). It is
+  deliberately **not** ported from my CG2025 HW7 coursework: that project's
+  `ggx_utils.hpp` came from a third party repository, which the course rules
+  would require me to get approved and credit. The two are the same published
+  algorithm, but this one is written here from the papers.
 * The procedural shapes follow the published distance estimators rather than any
   particular implementation: the power-8 Mandelbulb distance estimate from White
   and Nylander, *Mandelbulb: The Unravelling of the Real 3D Mandelbrot Fractal*
