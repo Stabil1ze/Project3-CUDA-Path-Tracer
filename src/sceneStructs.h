@@ -57,6 +57,11 @@ struct Camera
     glm::vec3 right;
     glm::vec2 fov;
     glm::vec2 pixelLength;
+    // Thin lens model (optional scene fields "APERTURE" and "FOCUS"): the
+    // aperture is the lens radius and the focus the distance of the focal
+    // plane. aperture == 0 keeps the camera a pinhole.
+    float aperture;
+    float focalDistance;
 };
 
 struct RenderState

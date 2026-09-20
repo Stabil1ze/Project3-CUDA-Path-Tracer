@@ -214,16 +214,23 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         int index = x + (y * cam.resolution.x);
         PathSegment& segment = pathSegments[index];
 
-        segment.ray.origin = cam.position;
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
         // Grid coordinate of the sample. Note the convention of the camera
-        // transform above: at x = 0 the offset is exactly -resolution.x * 0.5
+        // transform below: at x = 0 the offset is exactly -resolution.x * 0.5
         // times one pixel length, i.e. the left edge of the view. So integer
         // (x, y) addresses the *corner* of a pixel and the pixel area is
         // [x, x + 1) x [y, y + 1) - not [x - 0.5, x + 0.5).
         float sampleX = (float)x;
         float sampleY = (float)y;
+
+        // Depth tag -1 gives the camera ray its own RNG stream: bounce `d`
+        // draws with tag `d`, so reusing tag 0 here would make the sub-pixel
+        // offset and the first scatter direction share random numbers.
+        constexpr int CAMERA_RNG_DEPTH = -1;
+        thrust::default_random_engine rng =
+            makeSeededRandomEngine(iter, index, CAMERA_RNG_DEPTH);
+        thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
 
 #if STOCHASTIC_AA
         // A fresh jitter per iteration turns the per-pixel value into the
@@ -232,22 +239,40 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         // The offset must span the whole pixel area, i.e. [0, 1) here; using
         // [-0.5, 0.5) would sample half of the previous pixel and blur every
         // edge across its neighbours.
-        //
-        // Depth tag -1 gives the camera ray its own RNG stream: bounce `d`
-        // draws with tag `d`, so reusing tag 0 here would make the sub-pixel
-        // offset and the first scatter direction share random numbers.
-        constexpr int CAMERA_RNG_DEPTH = -1;
-        thrust::default_random_engine rng =
-            makeSeededRandomEngine(iter, index, CAMERA_RNG_DEPTH);
-        thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
         sampleX += u01(rng);
         sampleY += u01(rng);
 #endif
 
-        segment.ray.direction = glm::normalize(cam.view
+        // Direction of the pinhole camera, i.e. the ray through the centre of
+        // the thin lens.
+        glm::vec3 pinholeDirection = glm::normalize(cam.view
             - cam.right * cam.pixelLength.x * (sampleX - (float)cam.resolution.x * 0.5f)
             - cam.up * cam.pixelLength.y * (sampleY - (float)cam.resolution.y * 0.5f)
         );
+
+        // --- Physically based depth of field (thin lens model) -------------
+        // Instead of firing every ray from the pinhole, sample a point on the
+        // lens disk and aim the ray at the same point of the focal plane.
+        // Everything at `focalDistance` therefore stays sharp no matter where
+        // on the lens the ray started, and the blur circle of an out of focus
+        // point grows with `aperture * |1/z - 1/focalDistance|`.
+        if (cam.aperture > 0.0f && cam.focalDistance > 0.0f)
+        {
+            float radius = cam.aperture * sqrtf(u01(rng));   // sqrt = uniform over the disk
+            float angle = TWO_PI * u01(rng);
+            glm::vec3 lensPoint = cam.position
+                + cam.right * (radius * cosf(angle))
+                + cam.up * (radius * sinf(angle));
+            glm::vec3 focalPoint = cam.position + pinholeDirection * cam.focalDistance;
+
+            segment.ray.origin = lensPoint;
+            segment.ray.direction = glm::normalize(focalPoint - lensPoint);
+        }
+        else
+        {
+            segment.ray.origin = cam.position;
+            segment.ray.direction = pinholeDirection;
+        }
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
