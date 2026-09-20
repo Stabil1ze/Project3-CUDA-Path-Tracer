@@ -23,8 +23,11 @@ endif()
 
 find_package(OpenGL REQUIRED)
 
+# CUDA 13 + MSVC: host (CXX) sources also include <cuda_runtime.h> (via sceneStructs.h),
+# so the CUDA toolkit include directory must be visible to every language, not only on UNIX.
+include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
+
 if(UNIX)
-    include_directories("${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
     find_package(glfw3 REQUIRED)
     find_package(GLEW REQUIRED)
     set(GL_LIBRARIES glfw ${GLEW_LIBRARIES} ${OPENGL_LIBRARIES})
@@ -104,18 +107,23 @@ source_group("ImGui\\Headers" FILES ${imgui_headers})
 source_group("ImGui\\Sources" FILES ${imgui_sources})
 
 #add_subdirectory(src/ImGui)
-#add_subdirectory(stream_compaction)  # TODO: uncomment if using your stream compaction
+add_subdirectory(stream_compaction)
 
 add_executable(${CMAKE_PROJECT_NAME} ${sources} ${headers} ${imgui_sources} ${imgui_headers})
 target_link_libraries(${CMAKE_PROJECT_NAME}
     ${GL_LIBRARIES}
-    #stream_compaction  # TODO: uncomment if using your stream compaction
+    stream_compaction
 )
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES CUDA_ARCHITECTURES native)
 
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE "$<$<AND:$<CONFIG:Debug,RelWithDebInfo>,$<COMPILE_LANGUAGE:CUDA>>:-G;-src-in-ptx>")
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-lineinfo;-src-in-ptx>")
+
+# CUDA 13 ships CCCL headers that refuse to build with MSVC's traditional preprocessor,
+# and cuda_runtime.h is pulled into the host sources too. Use the conforming preprocessor.
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/Zc:preprocessor>")
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<PLATFORM_ID:Windows>>:/Zc:preprocessor>")
 
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${CMAKE_PROJECT_NAME})
 
