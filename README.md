@@ -13,7 +13,7 @@ Project 3 - CUDA Path Tracer**
 *A closed room lit by a 5x5 ceiling light with three mirror spheres: global
 illumination (the teal and orange walls bleed onto the floor and onto the balls),
 one-bounce mirror reflections and soft shadowing. `scenes/showcase.json`,
-800x800, 3000 samples, 3m31s on the RTX 3060 Laptop.*
+800x800, 3000 samples, 3m55s on the RTX 3060 Laptop.*
 
 ## Overview
 
@@ -30,10 +30,13 @@ bounce loop, anti-aliasing and stream compaction.
 | 4 | Stream compaction of terminated paths - map / scan / scatter built on the work-efficient scan from my Project 2 | `src/pathtrace.cu`, `stream_compaction/` |
 | 5 | Emitter hits accumulate straight into the image, which is what allows terminated paths to be dropped | `src/pathtrace.cu` |
 | 6 | Per-bounce ray counting for the analysis (`[profile] ...` on stdout) | `src/pathtrace.cu` |
+| 7 | Physically based depth of field: thin lens camera driven by two optional scene fields (`APERTURE`, `FOCUS`), off by default | `src/pathtrace.cu`, `src/scene.cpp` |
+| 8 | Camera basis and orbit camera fixes (the base code mirrored the pitch and put the eye below the floor whenever a scene looked downwards) | `src/scene.cpp`, `src/main.cpp` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
-flipping one line and rebuilding.
+flipping one line and rebuilding; #7 is off unless a scene asks for it, so the
+pinhole path stays bit-identical to what the previous sections measured.
 
 ## Implementation
 
@@ -94,9 +97,12 @@ removes the stair-stepping on silhouettes:
 // is [x, x+1) and the jitter has to span [0, 1)
 float sampleX = (float)x;
 float sampleY = (float)y;
+
+// depth tag -1 gives the camera ray a random stream of its own
+thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, -1);
+thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+
 #if STOCHASTIC_AA
-    thrust::default_random_engine rng = makeSeededRandomEngine(iter, index, -1);
-    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
     sampleX += u01(rng);
     sampleY += u01(rng);
 #endif
@@ -109,6 +115,11 @@ And the offset has to cover `[0, 1)` rather than `[-0.5, 0.5)`: with a `+/- 0.5`
 jitter a pixel also samples half of its neighbour, which behaves like a box filter
 shifted by half a pixel and measurably does *not* reduce the error against a
 supersampled reference.
+
+The camera random stream is created unconditionally (and the jitter only drawn
+under `#if STOCHASTIC_AA`) because the depth of field below reuses the same stream:
+with `STOCHASTIC_AA` off the two draws then go to the lens sample instead of being
+wasted.
 
 ### Stream compaction
 
@@ -145,6 +156,104 @@ Stream compaction is a pure optimization - with it enabled the image is
 **bit-identical** to rendering with it disabled (`RMSE = 0` over the whole 800x800
 image), because the RNG seed is `(iteration, pixelIndex, depth)` and does not
 depend on the array slot a path happens to live in.
+
+### Depth of field
+
+A pinhole camera is sharp at every distance. The thin lens model replaces the
+single eye point with a disk of radius `APERTURE` and aims every ray at the point
+where the *pinhole* ray crosses the focal plane at distance `FOCUS`, so a point at
+exactly that distance is still imaged to a single point no matter where on the
+lens the ray started:
+
+```cpp
+// pinholeDirection is the direction the camera would fire with aperture == 0
+if (cam.aperture > 0.0f && cam.focalDistance > 0.0f)
+{
+    float radius = cam.aperture * sqrtf(u01(rng));   // sqrt = uniform over the disk
+    float angle  = TWO_PI * u01(rng);
+    glm::vec3 lensPoint  = cam.position
+        + cam.right * (radius * cosf(angle))
+        + cam.up    * (radius * sinf(angle));
+    glm::vec3 focalPoint = cam.position + pinholeDirection * cam.focalDistance;
+
+    segment.ray.origin    = lensPoint;
+    segment.ray.direction = glm::normalize(focalPoint - lensPoint);
+}
+else
+{
+    segment.ray.origin    = cam.position;
+    segment.ray.direction = pinholeDirection;
+}
+```
+
+The square root is what makes the samples uniform over the *area* of the disk
+rather than clumped around its centre, and drawing `radius` and `angle` from the
+same camera-ray stream that anti-aliasing uses means the pixel position and the
+lens position vary together over the iterations - the estimator becomes an average
+over the pixel *and* over the lens. Because both random numbers are always drawn
+in this branch, switching anti-aliasing off simply hands two draws to the lens
+sample instead of wasting them.
+
+Two optional fields were added to the scene format:
+
+| field | meaning | default |
+|---|---|---|
+| `APERTURE` | lens radius in world units, `0` keeps the camera a pinhole | `0` |
+| `FOCUS` | distance of the focal plane | `\|lookAt - position\|` |
+
+`FOCUS` defaults to the distance of the look-at point, i.e. "the thing I am looking
+at is in focus", and `APERTURE` defaults to a pinhole - so every scene written
+before this feature, and every measurement in this README, keeps rendering through
+the original pinhole path. The blur of a point at distance `z` is a disk of
+diameter
+
+$$
+c = 2 \cdot \text{aperture} \cdot \frac{|z - \text{FOCUS}|}{z}
+$$
+
+world units at that depth (similar triangles between the lens and the focal
+plane), which grows linearly with the aperture and is asymmetric around the focus
+plane: at a fixed aperture an object twice as far away is blurred half as much as
+one twice as close.
+
+![](img/dof-aperture-sweep.png)
+
+*Aperture sweep at a fixed focus distance of 8.75, the third mirror sphere. 400x400,
+1500 samples: with the aperture closed (top left) every sphere is equally sharp;
+opening it blurs the near diffuse ball and the first two mirrors while the sphere
+at the focus distance stays crisp. The shadows under the balls blur with their
+casters, which is the geometrically correct behaviour and the usual tell of a real
+lens.*
+
+![](img/dof-focus-plane.png)
+
+*The same scene at aperture 0.5 with the focal plane moved onto the near ball
+(3.80), onto the third mirror (8.75) and onto the last mirror (12.71). The ball is
+2.8 units across and its blur disk at 3.80 is `2 * 0.5 * |3.8 - 8.75| / 3.8` = 1.30
+units, almost half its diameter - which is why the ball is sharp while the room
+behind it dissolves in the left panel, and why every mirror except the last one is
+blurred in the right one.*
+
+![](img/dof.png)
+
+*`scenes/dof.json` at 800x800, 2000 samples, aperture 0.25: the focus plane sits on
+the third of the five mirrors running away from the camera.*
+
+**A camera bug this feature uncovered.** Writing the scene for this feature turned
+up a bug in the base code's interactive camera. `main()` recovers the orbit camera
+parameters (azimuth, elevation, distance) from the scene's `EYE`/`LOOKAT` pair,
+and `runCuda()` rebuilds the eye position and the basis from them, so the two have
+to be exact inverses. The recovery used `acos(normalize((0, view.y, view.z)) . (0,
+1, 0))`, which is the *mirror* of the elevation rather than the elevation: any
+scene that looks downwards (including the supplied `scenes/showcase.json`) had its
+pitch flipped and its eye mirrored below the look-at point - the DOF scene put the
+camera under the floor, looking up, and rendered black. The elevation is now
+recovered as `acos(-forward.y)` with `forward` the unit eye-to-look-at vector, and
+the camera basis is normalised (`cross(view, up)` was used unnormalised, which
+squeezed the horizontal field of view of every tilted camera). Both changes are
+exact no-ops for a level camera: the Cornell images in this README are
+bit-identical before and after the fix, and the cover image was re-rendered
+because `scenes/showcase.json` intentionally looks down.
 
 ## Performance Analysis
 
@@ -209,6 +318,39 @@ off, right: AA on) shows the same thing:
 
 ![](img/aa-comparison.png)
 
+### Depth of field: cost
+
+The thin lens model costs two extra random numbers, a square root and a
+sine/cosine pair - but only on the **camera** ray, never on the interior bounces
+that dominate a render. Interleaved runs of the same scene (800x800, 300 spp, three
+runs each, medians):
+
+| aperture | median render time | vs pinhole |
+|---|---:|---:|
+| 0.0 (pinhole) | 18.97 s | - |
+| 0.5 | 19.49 s | +2.7% |
+
+Individual runs were 18.75 / 19.72 / 18.97 s and 19.49 / 19.26 / 19.91 s, so the
+2.7% is at the edge of run-to-run spread - the honest reading is "under 3%, of the
+same order as the two extra RNG draws it actually adds".
+
+On a hypothetical CPU version of this renderer the two extra lines would cost the
+same per ray, and the feature would look just as cheap in a profiler - but it would
+be paid *serially*, once per ray, on every one of the millions of camera rays.
+What makes it free here is that the work is per-ray and has no cross-ray
+communication: no extra memory traffic (the lens offset is two registers), no
+divergence (the `aperture > 0` branch is uniform across the grid, and the rest is
+straight-line arithmetic), and the camera kernel is a tiny fraction of the frame
+time next to 8 bounces of intersection and shading. Depth of field therefore scales
+with the number of pixels, not with the depth of the paths, which is the opposite
+of every other feature in this project.
+
+Two obvious next steps if it ever showed up in a profile: sample the disk from a
+precomputed low-discrepancy table (a concentric or Sobol disk) instead of
+`sqrt`/`cos`/`sin` per ray, and fold the four camera-ray random numbers (two for
+anti-aliasing, two for the lens) into one stratified 4D sample so that the pixel
+area *and* the lens disk are jointly stratified instead of independently jittered.
+
 ### Validation against the reference image
 
 `img/REFERENCE_cornell.5000samp.png` ships with the base code and my render
@@ -233,6 +375,7 @@ specular as a core feature, so the sphere reflects the room instead.
 | `scenes/cornell.json` | the supplied Cornell box (open towards the camera) |
 | `scenes/cornell_closed.json` | the same box with a front wall and the camera moved inside, so no ray can escape - the closed case of the compaction analysis |
 | `scenes/showcase.json` | the cover image: a closed room, a 5x5 ceiling light, three mirror spheres and a diffuse ball |
+| `scenes/dof.json` | the depth of field scene: five mirrors receding from the camera, a near diffuse ball and `APERTURE` / `FOCUS` in the camera block |
 
 No meshes or texture files are used, so nothing has to be downloaded to render
 them.
@@ -266,7 +409,8 @@ uncommented to link my Project 2 implementation, and
   built from the cubes and spheres the base code already supports.
 * References used for the shading: PBRT v4 sections 9.2 (diffuse reflection) and
   9.3 (specular reflection and transmission), GPU Gems 3, Ch. 20 for the specular
-  sampling model, and Paul Bourke's raytracing notes for anti-aliasing.
+  sampling model, Paul Bourke's raytracing notes for anti-aliasing, and PBRT v4
+  section 5.2.3 (the thin lens model) for the depth of field camera.
 * The code in this project was written with the help of AI agents (pair
   programming over the CUDA/C++ sources, the build fixes and this README), in line
   with the course's third-party code policy.
