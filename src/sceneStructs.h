@@ -12,7 +12,12 @@
 enum GeomType
 {
     SPHERE,
-    CUBE
+    CUBE,
+    // Procedural shapes, evaluated as signed distance fields and intersected by
+    // sphere tracing (see intersections.cu). Both live in a unit-ish object
+    // space and are transformed by the geometry's matrix like any other object.
+    MANDELBULB,
+    MENGER
 };
 
 struct Ray
@@ -45,6 +50,13 @@ struct Material
     float hasRefractive;
     float indexOfRefraction;
     float emittance;
+    // Procedural texture that modulates the diffuse albedo, evaluated on the
+    // *object space* position of the hit (so the pattern sticks to the object
+    // and follows its transform): 0 = none, 1 = checker, 2 = marble. The scale
+    // multiplies that position, i.e. it sets how many pattern cells fit into
+    // one unit of object space.
+    int textureType;
+    float textureScale;
 };
 
 struct Camera
@@ -89,4 +101,8 @@ struct ShadeableIntersection
   float t;
   glm::vec3 surfaceNormal;
   int materialId;
+  // Index into the geometry array. The shading kernel needs the geometry, not
+  // just the material, to map a hit point back into object space for the
+  // procedural textures.
+  int geomId;
 };

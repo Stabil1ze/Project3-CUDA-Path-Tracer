@@ -116,3 +116,83 @@ __host__ __device__ void scatterRay(
     constexpr float RAY_EPSILON = 1e-3f;
     pathSegment.ray.origin = intersect + normal * RAY_EPSILON;
 }
+
+// ---------------------------------------------------------------------------
+// Procedural textures
+// ---------------------------------------------------------------------------
+// Both textures are pure functions of the object space hit point, which is what
+// makes them procedural: no files, no texture memory, no UVs, and the same code
+// works on any shape - including the SDF fractals, whose UV layout would be a
+// nightmare to define.
+
+__host__ __device__ inline float hashToUnitFloat(unsigned int x)
+{
+    // Integer finaliser (shifts + multiplies, very cheap on the GPU) that hides
+    // the lattice structure of the value noise below.
+    x ^= x >> 17;
+    x *= 0xed5ad4bbu;
+    x ^= x >> 11;
+    x *= 0xac4c1b51u;
+    x ^= x >> 15;
+    return (float)(x & 0x00ffffffu) * (1.0f / 16777216.0f);
+}
+
+__host__ __device__ inline float latticeNoise(int x, int y, int z)
+{
+    unsigned int h = ((unsigned int)(x * 73856093))
+        ^ ((unsigned int)(y * 19349663))
+        ^ ((unsigned int)(z * 83492791));
+    return hashToUnitFloat(h);
+}
+
+// Trilinear value noise with a smoothstep fade: 8 hashes and 7 lerps per octave.
+__host__ __device__ inline float valueNoise(glm::vec3 p)
+{
+    glm::vec3 i = glm::floor(p);
+    glm::vec3 f = p - i;
+    glm::vec3 w = f * f * (3.0f - 2.0f * f);
+
+    int x = (int)i.x, y = (int)i.y, z = (int)i.z;
+    float c000 = latticeNoise(x, y, z),       c100 = latticeNoise(x + 1, y, z);
+    float c010 = latticeNoise(x, y + 1, z),   c110 = latticeNoise(x + 1, y + 1, z);
+    float c001 = latticeNoise(x, y, z + 1),   c101 = latticeNoise(x + 1, y, z + 1);
+    float c011 = latticeNoise(x, y + 1, z + 1), c111 = latticeNoise(x + 1, y + 1, z + 1);
+
+    float x00 = glm::mix(c000, c100, w.x), x10 = glm::mix(c010, c110, w.x);
+    float x01 = glm::mix(c001, c101, w.x), x11 = glm::mix(c011, c111, w.x);
+    return glm::mix(glm::mix(x00, x10, w.y), glm::mix(x01, x11, w.y), w.z);
+}
+
+// Fractal sum of value noise.
+__host__ __device__ inline float fractalNoise(glm::vec3 p)
+{
+    float sum = 0.0f;
+    float amplitude = 0.5f;
+    for (int i = 0; i < 5; i++)
+    {
+        sum += amplitude * valueNoise(p);
+        p *= 2.03f;         // not exactly 2, so the octaves do not line up
+        amplitude *= 0.5f;
+    }
+    return sum;
+}
+
+__host__ __device__ glm::vec3 evaluateProceduralTexture(int textureType, glm::vec3 p)
+{
+    if (textureType == 1)
+    {
+        // Checker board: the parity of the lattice cell the point falls in. The
+        // albedo is multiplied by either 1 or a dark value, so a coloured
+        // material keeps its colour but gains dark squares.
+        float cells = glm::floor(p.x) + glm::floor(p.y) + glm::floor(p.z);
+        float parity = glm::mod(cells, 2.0f);
+        return glm::mix(glm::vec3(1.0f), glm::vec3(0.08f, 0.08f, 0.10f), parity);
+    }
+
+    // Marble: veins along a diagonal, distorted by fractal noise. sin^2 keeps the
+    // result in [0, 1] so the multiplier never brightens the albedo.
+    float veins = fractalNoise(p);
+    float bands = sinf((p.x + p.y * 0.6f + p.z * 0.35f) * 3.0f + veins * 6.0f);
+    bands = bands * bands;
+    return glm::mix(glm::vec3(0.34f, 0.33f, 0.40f), glm::vec3(1.0f), bands);
+}

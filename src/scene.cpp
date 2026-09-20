@@ -66,6 +66,26 @@ void Scene::loadFromJSON(const std::string& jsonName)
             newMaterial.specular.color = newMaterial.color;
             newMaterial.specular.exponent = p.value("ROUGHNESS", 0.0f);
         }
+
+        // Optional procedural texture for the diffuse albedo. It is evaluated on
+        // the object space hit point (see interactions.cu), and TEXSCALE sets how
+        // many pattern cells fit into one object space unit.
+        const std::string texture = p.value("TEXTURE", std::string("none"));
+        if (texture == "checker")
+        {
+            newMaterial.textureType = 1;
+        }
+        else if (texture == "marble")
+        {
+            newMaterial.textureType = 2;
+        }
+        else if (texture != "none")
+        {
+            cout << "Unknown TEXTURE '" << texture << "' on material " << name
+                 << ", ignoring it" << endl;
+        }
+        newMaterial.textureScale = p.value("TEXSCALE", 1.0f);
+
         MatNameToID[name] = materials.size();
         materials.emplace_back(newMaterial);
     }
@@ -78,8 +98,21 @@ void Scene::loadFromJSON(const std::string& jsonName)
         {
             newGeom.type = CUBE;
         }
+        else if (type == "Mandelbulb")
+        {
+            newGeom.type = MANDELBULB;
+        }
+        else if (type == "Menger")
+        {
+            newGeom.type = MENGER;
+        }
+        else if (type == "sphere")
+        {
+            newGeom.type = SPHERE;
+        }
         else
         {
+            cout << "Unknown object TYPE '" << type << "', treating it as a sphere" << endl;
             newGeom.type = SPHERE;
         }
         newGeom.materialid = MatNameToID[p["MATERIAL"]];

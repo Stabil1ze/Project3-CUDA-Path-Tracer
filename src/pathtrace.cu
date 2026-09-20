@@ -29,6 +29,12 @@
 // keeps dead rays in the arrays and just skips them.
 #define STREAM_COMPACTION 1
 
+// Instrumentation for the procedural shapes: count the sphere tracing steps of
+// every SDF intersection test into a global counter plus a 16 bucket histogram,
+// which are copied back and printed at the end of the render. The atomics cost
+// a few percent, so set it to 0 when timing the scene.
+#define SDF_STATS 1
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -108,9 +114,17 @@ static int h_scanCapacity = 0;         // elements allocated for dev_scanIndices
 // both configurations; only the amount of work differs.
 static const int MAX_PROFILE_DEPTH = 64;
 static long long h_bounceAlive[MAX_PROFILE_DEPTH];
-static long long h_firstIterAlive[MAX_PROFILE_DEPTH];
 static long long h_profileIters = 0;
 
+// Instrumentation for the procedural shapes (see SDF_STATS above): total sphere
+// tracing steps and a histogram of the steps a single test needed. Both live on
+// the device and are only touched by rays that test an SDF object.
+static const int SDF_HISTOGRAM_BUCKETS = 16;
+static const int SDF_STEPS_PER_BUCKET = 8;
+static unsigned long long* dev_sdfSteps = NULL;
+static unsigned int* dev_sdfHistogram = NULL;
+static unsigned long long h_sdfSteps = 0;
+static unsigned int h_sdfHistogram[SDF_HISTOGRAM_BUCKETS];
 static int nextPowerOfTwoAtLeast(int n)
 {
     int m = 1;
@@ -136,6 +150,48 @@ static void printBounceProfile(const char* tag, const long long* counts, int seg
             100.0 * (double)alive / (double)pixelcount);
     }
     printf("\n");
+}
+
+// README instrumentation for the procedural shapes: how many sphere tracing
+// steps the SDF tests needed on average, and how they are distributed. The
+// spread is the interesting part on a GPU - every thread in a warp marches until
+// its own ray leaves the bounding sphere, so the warps pay the maximum of 32
+// different step counts.
+static void printSdfStats(int pixelcount)
+{
+#if SDF_STATS
+    if (dev_sdfSteps == NULL)
+    {
+        return;
+    }
+    cudaMemcpy(&h_sdfSteps, dev_sdfSteps, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sdfHistogram, dev_sdfHistogram,
+        SDF_HISTOGRAM_BUCKETS * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+
+    unsigned int tests = 0;
+    for (int i = 0; i < SDF_HISTOGRAM_BUCKETS; i++)
+    {
+        tests += h_sdfHistogram[i];
+    }
+    if (tests == 0)
+    {
+        return;
+    }
+
+    printf("[sdf] sphere tracing: %u marches, %.1f steps per march, %.2f steps per camera ray",
+        tests, (double)h_sdfSteps / (double)tests, (double)h_sdfSteps / (double)pixelcount);
+    printf("\n[sdf] steps per march histogram (bucket width %d):", SDF_STEPS_PER_BUCKET);
+    for (int i = 0; i < SDF_HISTOGRAM_BUCKETS; i++)
+    {
+        if (h_sdfHistogram[i] == 0)
+        {
+            continue;
+        }
+        printf(" %d-%d:%u", i * SDF_STEPS_PER_BUCKET,
+            (i + 1) * SDF_STEPS_PER_BUCKET - 1, h_sdfHistogram[i]);
+    }
+    printf("\n");
+#endif
 }
 
 void InitDataContainer(GuiDataContainer* imGuiData)
@@ -175,8 +231,13 @@ void pathtraceInit(Scene* scene)
     for (int i = 0; i < MAX_PROFILE_DEPTH; i++)
     {
         h_bounceAlive[i] = 0;
-        h_firstIterAlive[i] = 0;
     }
+
+    // Instrumentation for the procedural shapes (sphere tracing steps).
+    cudaMalloc(&dev_sdfSteps, sizeof(unsigned long long));
+    cudaMemset(dev_sdfSteps, 0, sizeof(unsigned long long));
+    cudaMalloc(&dev_sdfHistogram, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned int));
+    cudaMemset(dev_sdfHistogram, 0, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned int));
 
     checkCUDAError("pathtraceInit");
 }
@@ -192,6 +253,10 @@ void pathtraceFree()
     cudaFree(dev_intersectionsAlt);
     cudaFree(dev_alive);
     cudaFree(dev_scanIndices);
+    cudaFree(dev_sdfSteps);
+    cudaFree(dev_sdfHistogram);
+    dev_sdfSteps = NULL;
+    dev_sdfHistogram = NULL;
 
     checkCUDAError("pathtraceFree");
 }
@@ -289,7 +354,9 @@ __global__ void computeIntersections(
     PathSegment* pathSegments,
     Geom* geoms,
     int geoms_size,
-    ShadeableIntersection* intersections)
+    ShadeableIntersection* intersections,
+    unsigned long long* sdfStepCounter,
+    unsigned int* sdfHistogram)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -330,6 +397,13 @@ __global__ void computeIntersections(
             {
                 t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
             }
+            else if (geom.type == MANDELBULB || geom.type == MENGER)
+            {
+                // Procedural signed distance field shapes: sphere traced, with
+                // an optional bounding sphere clip (see intersections.cu).
+                t = sdfIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside,
+                    sdfStepCounter, sdfHistogram);
+            }
             // TODO: add more intersection tests here... triangle? metaball? CSG?
 
             // Compute the minimum t from the intersection tests to determine what
@@ -346,6 +420,7 @@ __global__ void computeIntersections(
         if (hit_geom_index == -1)
         {
             intersections[path_index].t = -1.0f;
+            intersections[path_index].geomId = -1;
         }
         else
         {
@@ -353,6 +428,7 @@ __global__ void computeIntersections(
             intersections[path_index].t = t_min;
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = normal;
+            intersections[path_index].geomId = hit_geom_index;
         }
     }
 }
@@ -382,6 +458,7 @@ __global__ void shadeMaterials(
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
     Material* materials,
+    Geom* geoms,
     glm::vec3* image)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -439,13 +516,28 @@ __global__ void shadeMaterials(
         return;
     }
 
+    // World space point of the hit, needed both by the procedural texture below
+    // and by the scatter.
+    glm::vec3 intersect = pathSegment.ray.origin
+        + intersection.t * glm::normalize(pathSegment.ray.direction);
+
+    // Procedural texture: map the hit point back into object space (which is
+    // where the pattern is defined, so it is attached to the object and follows
+    // its transform) and modulate the albedo by the pattern. Emitters returned
+    // above, so this only ever changes the diffuse/specular colour of a surface.
+    if (material.textureType > 0 && intersection.geomId >= 0)
+    {
+        const Geom& geom = geoms[intersection.geomId];
+        glm::vec3 objectSpace = multiplyMV(geom.inverseTransform, glm::vec4(intersect, 1.0f));
+        material.color *= evaluateProceduralTexture(material.textureType,
+            objectSpace * material.textureScale);
+        material.specular.color = material.color;
+    }
+
     // (4) Regular surface: evaluate the BSDF to update the throughput and
     //     generate the next ray. Seeding by (iteration, pixel, depth) keeps the
     //     samples of one pixel independent across iterations while still being
     //     reproducible.
-    glm::vec3 intersect = pathSegment.ray.origin
-        + intersection.t * glm::normalize(pathSegment.ray.direction);
-
     thrust::default_random_engine rng =
         makeSeededRandomEngine(iter, pathSegment.pixelIndex, depth);
 
@@ -640,7 +732,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             paths,
             dev_geoms,
             hst_scene->geoms.size(),
-            intersections
+            intersections,
+            dev_sdfSteps,
+            dev_sdfHistogram
         );
         checkCUDAError("trace one bounce");
 
@@ -657,6 +751,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             intersections,
             paths,
             dev_materials,
+            dev_geoms,
             dev_image
         );
         checkCUDAError("shade one bounce");
@@ -703,6 +798,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     {
         printBounceProfile("average over all iterations - paths processed after each bounce:",
             h_bounceAlive, maxSegments, h_profileIters, pixelcount);
+        printSdfStats(pixelcount);
     }
 
     ///////////////////////////////////////////////////////////////////////////

@@ -5,6 +5,13 @@
 #include <glm/glm.hpp>
 #include <glm/gtx/intersect.hpp>
 
+// Compile-time toggle for the procedural shape intersection: 1 clips the ray
+// against each shape's bounding sphere before sphere tracing it, 0 marches every
+// ray (the "before" side of the culling measurement in the README).
+#ifndef SDF_BOUNDING_SPHERE
+#define SDF_BOUNDING_SPHERE 1
+#endif
+
 
 /**
  * Handy-dandy hash function that provides seeds for random number generation.
@@ -71,3 +78,37 @@ __host__ __device__ float sphereIntersectionTest(
     glm::vec3& intersectionPoint,
     glm::vec3& normal,
     bool& outside);
+
+// CHECKITOUT
+/**
+ * Test intersection between a ray and one of the procedural signed distance
+ * field shapes (MANDELBULB, MENGER). Unlike the primitives above there is no
+ * closed form for the hit, so the ray is marched with sphere tracing: the SDF
+ * gives a lower bound on the distance to the surface, so a step of that size can
+ * never tunnel through it.
+ *
+ * The march runs in world space but evaluates the SDF in object space, so the
+ * step is divided by the object's largest scale factor - scaling a Lipschitz-1
+ * field by s turns it into a Lipschitz-s field, and without that division a
+ * scaled up object would be stepped straight through.
+ *
+ * @param stepCounter  Optional instrumentation: adds the number of marching
+ *                     steps this call used (may be NULL).
+ * @param histogram    Optional instrumentation: 16 buckets of 8 steps (may be
+ *                     NULL).
+ * @return             Ray parameter `t` value. -1 if no intersection.
+ */
+__host__ __device__ float sdfIntersectionTest(
+    Geom geom,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside,
+    unsigned long long* stepCounter,
+    unsigned int* histogram);
+
+/**
+ * Evaluate the signed distance field of `geom` at an object space point. Units:
+ * object space, i.e. distance to the surface in the untransformed shape.
+ */
+__host__ __device__ float sdfEvaluate(int geomType, glm::vec3 p);

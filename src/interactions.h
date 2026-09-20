@@ -50,3 +50,15 @@ __host__ __device__ void scatterRay(
     glm::vec3 normal,
     const Material& m,
     thrust::default_random_engine& rng);
+
+// CHECKITOUT
+/**
+ * Evaluate a procedural texture and return the factor it applies to the
+ * material's albedo. The pattern is a function of the *object space* position of
+ * the hit point, so it is attached to the object (and follows its transform)
+ * rather than to world space.
+ *
+ * `textureType` 1 = checker, 2 = marble (see the definitions in interactions.cu);
+ * `p` is the already scaled object space point.
+ */
+__host__ __device__ glm::vec3 evaluateProceduralTexture(int textureType, glm::vec3 p);
