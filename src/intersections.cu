@@ -210,7 +210,7 @@ __host__ __device__ float sdfIntersectionTest(
     glm::vec3& normal,
     bool& outside,
     unsigned long long* stepCounter,
-    unsigned int* histogram)
+    unsigned long long* histogram)
 {
     constexpr int MAX_STEPS = 128;
     constexpr int HISTOGRAM_BUCKETS = 16;
@@ -270,8 +270,10 @@ __host__ __device__ float sdfIntersectionTest(
     }
     if (histogram != NULL)
     {
+        // 64 bit: a 800x800/3000spp render produces ~5e9 marches, which wraps a
+        // 32 bit bucket and silently corrupts the reported average.
         int bucket = glm::min(steps / STEPS_PER_BUCKET, HISTOGRAM_BUCKETS - 1);
-        atomicAdd(&histogram[bucket], 1u);
+        atomicAdd(&histogram[bucket], 1ull);
     }
 #endif
 

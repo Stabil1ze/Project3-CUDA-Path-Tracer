@@ -122,9 +122,9 @@ static long long h_profileIters = 0;
 static const int SDF_HISTOGRAM_BUCKETS = 16;
 static const int SDF_STEPS_PER_BUCKET = 8;
 static unsigned long long* dev_sdfSteps = NULL;
-static unsigned int* dev_sdfHistogram = NULL;
+static unsigned long long* dev_sdfHistogram = NULL;
 static unsigned long long h_sdfSteps = 0;
-static unsigned int h_sdfHistogram[SDF_HISTOGRAM_BUCKETS];
+static unsigned long long h_sdfHistogram[SDF_HISTOGRAM_BUCKETS];
 static int nextPowerOfTwoAtLeast(int n)
 {
     int m = 1;
@@ -166,9 +166,9 @@ static void printSdfStats(int pixelcount)
     }
     cudaMemcpy(&h_sdfSteps, dev_sdfSteps, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
     cudaMemcpy(h_sdfHistogram, dev_sdfHistogram,
-        SDF_HISTOGRAM_BUCKETS * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+        SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
 
-    unsigned int tests = 0;
+    unsigned long long tests = 0;
     for (int i = 0; i < SDF_HISTOGRAM_BUCKETS; i++)
     {
         tests += h_sdfHistogram[i];
@@ -179,7 +179,8 @@ static void printSdfStats(int pixelcount)
     }
 
     printf("[sdf] sphere tracing: %u marches, %.1f steps per march, %.2f steps per camera ray",
-        tests, (double)h_sdfSteps / (double)tests, (double)h_sdfSteps / (double)pixelcount);
+        (unsigned int)tests, (double)h_sdfSteps / (double)tests,
+        (double)h_sdfSteps / (double)pixelcount);
     printf("\n[sdf] steps per march histogram (bucket width %d):", SDF_STEPS_PER_BUCKET);
     for (int i = 0; i < SDF_HISTOGRAM_BUCKETS; i++)
     {
@@ -187,7 +188,7 @@ static void printSdfStats(int pixelcount)
         {
             continue;
         }
-        printf(" %d-%d:%u", i * SDF_STEPS_PER_BUCKET,
+        printf(" %d-%d:%llu", i * SDF_STEPS_PER_BUCKET,
             (i + 1) * SDF_STEPS_PER_BUCKET - 1, h_sdfHistogram[i]);
     }
     printf("\n");
@@ -236,8 +237,8 @@ void pathtraceInit(Scene* scene)
     // Instrumentation for the procedural shapes (sphere tracing steps).
     cudaMalloc(&dev_sdfSteps, sizeof(unsigned long long));
     cudaMemset(dev_sdfSteps, 0, sizeof(unsigned long long));
-    cudaMalloc(&dev_sdfHistogram, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned int));
-    cudaMemset(dev_sdfHistogram, 0, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned int));
+    cudaMalloc(&dev_sdfHistogram, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
+    cudaMemset(dev_sdfHistogram, 0, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
 
     checkCUDAError("pathtraceInit");
 }
@@ -356,7 +357,7 @@ __global__ void computeIntersections(
     int geoms_size,
     ShadeableIntersection* intersections,
     unsigned long long* sdfStepCounter,
-    unsigned int* sdfHistogram)
+    unsigned long long* sdfHistogram)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
 

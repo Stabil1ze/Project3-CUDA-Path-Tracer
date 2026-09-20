@@ -94,7 +94,8 @@ __host__ __device__ float sphereIntersectionTest(
  *
  * @param stepCounter  Optional instrumentation: adds the number of marching
  *                     steps this call used (may be NULL).
- * @param histogram    Optional instrumentation: 16 buckets of 8 steps (may be
+ * @param histogram    Optional instrumentation: 16 buckets of 8 steps, as 64 bit
+ *                     counters because a long render overflows 32 of them (may be
  *                     NULL).
  * @return             Ray parameter `t` value. -1 if no intersection.
  */
@@ -105,7 +106,7 @@ __host__ __device__ float sdfIntersectionTest(
     glm::vec3& normal,
     bool& outside,
     unsigned long long* stepCounter,
-    unsigned int* histogram);
+    unsigned long long* histogram);
 
 /**
  * Evaluate the signed distance field of `geom` at an object space point. Units:
