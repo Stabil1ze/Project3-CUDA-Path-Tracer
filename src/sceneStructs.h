@@ -109,4 +109,8 @@ struct ShadeableIntersection
   // just the material, to map a hit point back into object space for the
   // procedural textures.
   int geomId;
+  // 1 when the ray came from outside the primitive, 0 when it was already
+  // inside (the intersection tests report this). Refraction needs it to decide
+  // whether the path is entering or leaving the medium.
+  int outside;
 };

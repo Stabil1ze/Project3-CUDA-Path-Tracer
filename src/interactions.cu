@@ -44,10 +44,48 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
         + sin(around) * over * perpendicularDirection2;
 }
 
+// Dielectric radiance scaling: a transmitted ray that enters a denser medium
+// carries radiance scaled by (etaI / etaT)^2 (PBRT v3 8.2.3). It matters for any
+// path that ends inside the medium - a path that enters and leaves again gets the
+// factor and its inverse, but one that is terminated inside (depth budget or
+// Russian roulette) does not, and glass balls terminate a lot of paths inside.
+// Set to 0 to see the difference.
+#ifndef REFRACTION_RADIANCE_SCALING
+#define REFRACTION_RADIANCE_SCALING 1
+#endif
+
+/**
+ * Fresnel reflectance of a smooth dielectric interface, Schlick's approximation
+ * refined with the cosine of the *transmitted* angle (PBRT v3 8.2.3), which stays
+ * accurate for indices of refraction far from 1.5:
+ *
+ *     F = F0 + (1 - F0) (1 - cos(theta_t))^5,   F0 = ((etaI - etaT)/(etaI + etaT))^2
+ *
+ * Snell's law gives sin(theta_t) = etaI/etaT * sin(theta_i); when that exceeds 1
+ * the ray cannot leave the medium at all and the interface reflects everything
+ * (total internal reflection), which this reports as F = 1.
+ */
+__host__ __device__ inline float fresnelDielectricSchlick(float cosThetaI, float etaI, float etaT)
+{
+    float sinThetaTSq = (etaI * etaI) / (etaT * etaT) * (1.0f - cosThetaI * cosThetaI);
+    if (sinThetaTSq >= 1.0f)
+    {
+        return 1.0f;                                  // total internal reflection
+    }
+    float cosThetaT = sqrtf(glm::max(0.0f, 1.0f - sinThetaTSq));
+    float r0 = (etaI - etaT) / (etaI + etaT);
+    r0 = r0 * r0;
+    float x = 1.0f - cosThetaT;
+    float x2 = x * x;
+    float fresnel = r0 + (1.0f - r0) * x2 * x2 * x;    // x^5
+    return glm::clamp(fresnel, 0.0f, 1.0f);
+}
+
 __host__ __device__ void scatterRay(
     PathSegment & pathSegment,
     glm::vec3 intersect,
     glm::vec3 normal,
+    bool entering,
     const Material &m,
     thrust::default_random_engine &rng)
 {
@@ -59,17 +97,25 @@ __host__ __device__ void scatterRay(
     {
         normal = -normal;
     }
+    // Geometric normal (pointing outward) recovered from the flag: the
+    // intersection tests return the normal oriented against the incoming ray, so
+    // for a hit from the inside it comes back negated. Refraction swaps the
+    // indices of refraction by direction, not by which way the normal happens to
+    // point, so keep the outward one around.
+    const glm::vec3 outwardNormal = entering ? normal : -normal;
 
     // --- Pick which BSDF lobe this bounce uses ---------------------------
     // Each lobe is weighted by how much of the surface response it carries.
     // The lobe is chosen probabilistically and its throughput is divided by the
     // probability of having picked it, which keeps the estimator unbiased.
-    // Today the weights are 0/1 (a material is either diffuse or a mirror), so
-    // the sum is 1 and the division is a no-op - but the code stays correct for
-    // mixed materials such as glossy = diffuse + imperfect specular.
-    float diffuseWeight = (m.hasReflective > 0.0f) ? 0.0f : 1.0f;
+    // The weights are 0/1 for the materials the scenes use (a surface is
+    // diffuse, a mirror or a dielectric), so the sum is 1 and the division is a
+    // no-op - but the code stays correct for mixed materials such as
+    // glossy = diffuse + imperfect specular.
+    float diffuseWeight = (m.hasReflective > 0.0f || m.hasRefractive > 0.0f) ? 0.0f : 1.0f;
     float specularWeight = m.hasReflective;
-    float weightSum = diffuseWeight + specularWeight;
+    float dielectricWeight = m.hasRefractive;
+    float weightSum = diffuseWeight + specularWeight + dielectricWeight;
     if (weightSum <= 0.0f)
     {
         // Material with no usable lobe: fall back to a black diffuser instead
@@ -82,7 +128,9 @@ __host__ __device__ void scatterRay(
     glm::vec3 direction;
     glm::vec3 weight;
 
-    if (u01(rng) < diffuseWeight / weightSum)
+    // One draw selects the lobe from the cumulative weights.
+    const float lobe = u01(rng);
+    if (lobe < diffuseWeight / weightSum)
     {
         // --- Ideal diffuse (Lambertian) ---------------------------------
         // Sample the outgoing direction from a cosine-weighted hemisphere;
@@ -94,7 +142,7 @@ __host__ __device__ void scatterRay(
         direction = calculateRandomDirectionInHemisphere(normal, rng);
         weight = m.color * (diffuseWeight / probability);
     }
-    else
+    else if (lobe < (diffuseWeight + specularWeight) / weightSum)
     {
         // --- Perfect specular (mirror) ----------------------------------
         // The reflected direction is the only direction with a non-zero pdf
@@ -106,15 +154,67 @@ __host__ __device__ void scatterRay(
         direction = glm::reflect(glm::normalize(pathSegment.ray.direction), normal);
         weight = m.specular.color * (specularWeight / probability);
     }
+    else
+    {
+        // --- Smooth dielectric (glass, water) ----------------------------
+        // A dielectric has exactly two delta directions: the mirror direction
+        // and the refracted one. They are chosen with the Fresnel probability,
+        // so the estimator stays unbiased for any combination of angle and
+        // index of refraction:
+        //
+        //   reflect  with probability F        -> weight F / F = 1
+        //   transmit with probability (1 - F)  -> weight (1 - F) / (1 - F) = 1
+        //
+        // and the transmitted radiance is scaled by (etaI / etaT)^2, which is the
+        // factor that makes a path entering glass and leaving it again carry the
+        // right amount of energy (PBRT v3 8.2.3).
+        const float probability = dielectricWeight / weightSum;
+        const glm::vec3 incident = glm::normalize(pathSegment.ray.direction);
+
+        glm::vec3 n = outwardNormal;
+        if (glm::dot(n, incident) > 0.0f)
+        {
+            n = -n;                                   // hit the back face
+        }
+
+        const float etaI = entering ? 1.0f : m.indexOfRefraction;
+        const float etaT = entering ? m.indexOfRefraction : 1.0f;
+        const float cosThetaI = glm::clamp(glm::dot(-incident, n), 0.0f, 1.0f);
+        const float fresnel = fresnelDielectricSchlick(cosThetaI, etaI, etaT);
+
+        if (u01(rng) < fresnel)
+        {
+            direction = glm::reflect(incident, n);
+            weight = m.color * (dielectricWeight / probability);
+        }
+        else
+        {
+            direction = glm::normalize(glm::refract(incident, n, etaI / etaT));
+#if REFRACTION_RADIANCE_SCALING
+            const float radianceScale = (etaI / etaT) * (etaI / etaT);
+#else
+            const float radianceScale = 1.0f;
+#endif
+            weight = m.color * radianceScale * (dielectricWeight / probability);
+        }
+    }
 
     pathSegment.ray.direction = glm::normalize(direction);
     pathSegment.color *= weight;
 
     // Spawn the next ray from the hit point, nudged off the surface. Without
     // this the new ray can immediately re-intersect the surface it left
-    // (shadow acne) because of floating point error in `t`.
+    // (shadow acne) because of floating point error in `t`. The nudge has to go
+    // to the side the *new* ray leaves on: a transmitted ray goes into the
+    // medium, so pushing it back out along the incident side would trap it
+    // inside the surface.
+    glm::vec3 offsetNormal = outwardNormal;
+    if (glm::dot(offsetNormal, pathSegment.ray.direction) < 0.0f)
+    {
+        offsetNormal = -offsetNormal;
+    }
     constexpr float RAY_EPSILON = 1e-3f;
-    pathSegment.ray.origin = intersect + normal * RAY_EPSILON;
+    pathSegment.ray.origin = intersect + offsetNormal * RAY_EPSILON;
 }
 
 // ---------------------------------------------------------------------------

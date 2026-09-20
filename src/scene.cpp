@@ -66,6 +66,16 @@ void Scene::loadFromJSON(const std::string& jsonName)
             newMaterial.specular.color = newMaterial.color;
             newMaterial.specular.exponent = p.value("ROUGHNESS", 0.0f);
         }
+        else if (p["TYPE"] == "Refractive")
+        {
+            // Dielectric (glass/water): Fresnel-weighted reflection plus
+            // refraction through IOR, handled in scatterRay. IOR 1.5 is window
+            // glass, 1.33 water, 2.4 diamond.
+            newMaterial.hasRefractive = 1.0f;
+            newMaterial.indexOfRefraction = p.value("IOR", 1.5f);
+            // The material colour tints the dielectric lobe.
+            newMaterial.specular.color = newMaterial.color;
+        }
 
         // Optional procedural texture for the diffuse albedo. It is evaluated on
         // the object space hit point (see interactions.cu), and TEXSCALE sets how

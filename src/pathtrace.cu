@@ -48,6 +48,15 @@
 #define RESTARTABLE 1
 #define CHECKPOINT_PINNED_MEMORY 1
 
+// Russian roulette: from RR_MIN_DEPTH segments on, kill each path with a
+// probability that grows as its throughput shrinks, and divide the survivors by
+// the survival probability (which is what keeps the estimator unbiased). Set to 0
+// to render every path until it escapes, hits an emitter or runs out of depth -
+// the "before" side of the measurement in the README.
+#define RUSSIAN_ROULETTE 1
+#define RR_MIN_DEPTH 3              // segments; segment 1 is the camera ray
+#define RR_MIN_SURVIVAL 0.05f       // never keep fewer than 5% of the paths
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -138,6 +147,21 @@ static unsigned long long* dev_sdfSteps = NULL;
 static unsigned long long* dev_sdfHistogram = NULL;
 static unsigned long long h_sdfSteps = 0;
 static unsigned long long h_sdfHistogram[SDF_HISTOGRAM_BUCKETS];
+
+// Russian roulette instrumentation: how many paths reached the RR depth and how
+// many of them were killed, plus the mean survival probability they were given.
+// Only meaningful with RUSSIAN_ROULETTE 1.
+static unsigned long long* dev_rrDecisions = NULL;
+static unsigned long long* dev_rrKills = NULL;
+// The survival probabilities are summed in fixed point (thousandths). Summing
+// them into a single float does not work: the running total passes 2^24 after a
+// few million decisions, and from there on every increment of ~0.7 is smaller
+// than one ulp of the accumulator and is silently dropped.
+static unsigned long long* dev_rrSurvivalMilli = NULL;
+static unsigned long long h_rrDecisions = 0;
+static unsigned long long h_rrKills = 0;
+static unsigned long long h_rrSurvivalMilli = 0;
+
 static int nextPowerOfTwoAtLeast(int n)
 {
     int m = 1;
@@ -205,6 +229,35 @@ static void printSdfStats(int pixelcount)
             (i + 1) * SDF_STEPS_PER_BUCKET - 1, h_sdfHistogram[i]);
     }
     printf("\n");
+#endif
+}
+
+// README instrumentation for Russian roulette: how often it fired and what it
+// saved. The bounce profile above shows the same thing from the other side (the
+// surviving path counts drop once RR is on).
+static void printRussianRouletteStats(int pixelcount)
+{
+#if RUSSIAN_ROULETTE
+    if (dev_rrDecisions == NULL)
+    {
+        return;
+    }
+    cudaMemcpy(&h_rrDecisions, dev_rrDecisions, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_rrKills, dev_rrKills, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_rrSurvivalMilli, dev_rrSurvivalMilli, sizeof(unsigned long long),
+        cudaMemcpyDeviceToHost);
+    if (h_rrDecisions == 0)
+    {
+        return;
+    }
+
+    printf("[rr] %llu roulette decisions (%.2f per camera ray), %llu killed (%.1f%%), "
+        "mean survival probability %.3f\n",
+        h_rrDecisions, (double)h_rrDecisions / (double)pixelcount,
+        h_rrKills, 100.0 * (double)h_rrKills / (double)h_rrDecisions,
+        (double)h_rrSurvivalMilli / (1000.0 * (double)h_rrDecisions));
+#else
+    (void)pixelcount;
 #endif
 }
 
@@ -421,6 +474,13 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_sdfHistogram, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
     cudaMemset(dev_sdfHistogram, 0, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
 
+    cudaMalloc(&dev_rrDecisions, sizeof(unsigned long long));
+    cudaMemset(dev_rrDecisions, 0, sizeof(unsigned long long));
+    cudaMalloc(&dev_rrKills, sizeof(unsigned long long));
+    cudaMemset(dev_rrKills, 0, sizeof(unsigned long long));
+    cudaMalloc(&dev_rrSurvivalMilli, sizeof(unsigned long long));
+    cudaMemset(dev_rrSurvivalMilli, 0, sizeof(unsigned long long));
+
     checkCUDAError("pathtraceInit");
 }
 
@@ -439,6 +499,12 @@ void pathtraceFree()
     cudaFree(dev_sdfHistogram);
     dev_sdfSteps = NULL;
     dev_sdfHistogram = NULL;
+    cudaFree(dev_rrDecisions);
+    cudaFree(dev_rrKills);
+    cudaFree(dev_rrSurvivalMilli);
+    dev_rrDecisions = NULL;
+    dev_rrKills = NULL;
+    dev_rrSurvivalMilli = NULL;
     releaseCheckpointStaging();
 
     checkCUDAError("pathtraceFree");
@@ -802,6 +868,7 @@ __global__ void computeIntersections(
         {
             intersections[path_index].t = -1.0f;
             intersections[path_index].geomId = -1;
+            intersections[path_index].outside = 1;
         }
         else
         {
@@ -810,6 +877,7 @@ __global__ void computeIntersections(
             intersections[path_index].materialId = geoms[hit_geom_index].materialid;
             intersections[path_index].surfaceNormal = normal;
             intersections[path_index].geomId = hit_geom_index;
+            intersections[path_index].outside = outside ? 1 : 0;
         }
     }
 }
@@ -840,6 +908,9 @@ __global__ void shadeMaterials(
     PathSegment* pathSegments,
     Material* materials,
     Geom* geoms,
+    unsigned long long* rrDecisions,
+    unsigned long long* rrKills,
+    unsigned long long* rrSurvivalMilli,
     glm::vec3* image)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -922,7 +993,51 @@ __global__ void shadeMaterials(
     thrust::default_random_engine rng =
         makeSeededRandomEngine(iter, pathSegment.pixelIndex, depth);
 
-    scatterRay(pathSegment, intersect, intersection.surfaceNormal, material, rng);
+    scatterRay(pathSegment, intersect, intersection.surfaceNormal,
+        intersection.outside != 0, material, rng);
+
+#if RUSSIAN_ROULETTE
+    // --- Russian roulette ------------------------------------------------
+    // Every path that is still alive after a few bounces is given a survival
+    // probability equal to its throughput (clamped), and the survivors' weight is
+    // divided by that probability. Cheap, low-contribution paths therefore die
+    // early while the estimator stays unbiased:
+    //
+    //   E[killed? 0 : throughput / p] = p * (throughput / p) = throughput
+    //
+    // A path whose throughput is already tiny (a dark surface, a long chain of
+    // bounces) keeps contributing with a small probability instead of costing a
+    // full intersection + shading pass every iteration. This is the colour
+    // dependent version of the roulette in the specular/BSDF lobes above.
+    if (depth >= RR_MIN_DEPTH)
+    {
+        const float throughput = glm::max(pathSegment.color.x,
+            glm::max(pathSegment.color.y, pathSegment.color.z));
+        const float survival = glm::clamp(throughput,
+            RR_MIN_SURVIVAL, 1.0f);
+        if (rrDecisions != NULL)
+        {
+            atomicAdd(rrDecisions, 1ull);
+            atomicAdd(rrSurvivalMilli, (unsigned long long)(survival * 1000.0f + 0.5f));
+        }
+        thrust::uniform_real_distribution<float> rrU01(0.0f, 1.0f);
+        if (rrU01(rng) >= survival)
+        {
+            if (rrKills != NULL)
+            {
+                atomicAdd(rrKills, 1ull);
+            }
+            pathSegment.color = glm::vec3(0.0f);
+            pathSegment.remainingBounces = -1;
+            return;
+        }
+        pathSegment.color /= survival;
+    }
+#else
+    (void)rrDecisions;
+    (void)rrKills;
+    (void)rrSurvivalMilli;
+#endif
 
     pathSegment.remainingBounces--;
 }
@@ -1133,6 +1248,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             paths,
             dev_materials,
             dev_geoms,
+            dev_rrDecisions,
+            dev_rrKills,
+            dev_rrSurvivalMilli,
             dev_image
         );
         checkCUDAError("shade one bounce");
@@ -1180,6 +1298,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         printBounceProfile("average over all iterations - paths processed after each bounce:",
             h_bounceAlive, maxSegments, h_profileIters, pixelcount);
         printSdfStats(pixelcount);
+        printRussianRouletteStats(pixelcount);
     }
 
     ///////////////////////////////////////////////////////////////////////////

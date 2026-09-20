@@ -40,7 +40,9 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
  * `pathSegment.color` by the BSDF/pdf ratio of the branch that was taken.
  *
  * `intersect` is the world space hit point, `normal` the surface normal and
- * `m` the material that was hit.
+ * `m` the material that was hit. `entering` says whether the ray came from
+ * outside the primitive, which the dielectric lobe needs to swap the indices of
+ * refraction (and to know when total internal reflection applies).
  *
  * You may need to change the parameter list for your purposes!
  */
@@ -48,6 +50,7 @@ __host__ __device__ void scatterRay(
     PathSegment& pathSegment,
     glm::vec3 intersect,
     glm::vec3 normal,
+    bool entering,
     const Material& m,
     thrust::default_random_engine& rng);
 
