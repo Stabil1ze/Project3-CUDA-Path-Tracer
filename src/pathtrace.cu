@@ -17,6 +17,11 @@
 
 #define ERRORCHECK 1
 
+// Stochastic sampled antialiasing (Part 1 core feature): jitter the first ray
+// of every pixel inside its pixel area. Set to 0 to reproduce the aliased
+// "before" images for the write-up; 1 is the default.
+#define STOCHASTIC_AA 1
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -125,9 +130,10 @@ void pathtraceFree()
  * Generate PathSegments with rays from the camera through the screen into the
  * scene, which is the first bounce of rays.
  *
- * Antialiasing - add rays for sub-pixel sampling
- * motion blur  - jitter rays "in time"
- * lens effect  - jitter ray origin positions based on a lens
+ * Antialiasing - the first ray of each pixel is jittered inside the pixel area
+ *                (see STOCHASTIC_AA below).
+ * motion blur  - jitter rays "in time"            (not implemented)
+ * lens effect  - jitter ray origin positions based on a lens (not implemented)
  */
 __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, PathSegment* pathSegments)
 {
@@ -141,10 +147,36 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         segment.ray.origin = cam.position;
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
-        // TODO: implement antialiasing by jittering the ray
+        // Grid coordinate of the sample. Note the convention of the camera
+        // transform above: at x = 0 the offset is exactly -resolution.x * 0.5
+        // times one pixel length, i.e. the left edge of the view. So integer
+        // (x, y) addresses the *corner* of a pixel and the pixel area is
+        // [x, x + 1) x [y, y + 1) - not [x - 0.5, x + 0.5).
+        float sampleX = (float)x;
+        float sampleY = (float)y;
+
+#if STOCHASTIC_AA
+        // A fresh jitter per iteration turns the per-pixel value into the
+        // average radiance over the pixel area (a box filter) instead of a
+        // point sample, which is what removes the stair-stepping on edges.
+        // The offset must span the whole pixel area, i.e. [0, 1) here; using
+        // [-0.5, 0.5) would sample half of the previous pixel and blur every
+        // edge across its neighbours.
+        //
+        // Depth tag -1 gives the camera ray its own RNG stream: bounce `d`
+        // draws with tag `d`, so reusing tag 0 here would make the sub-pixel
+        // offset and the first scatter direction share random numbers.
+        constexpr int CAMERA_RNG_DEPTH = -1;
+        thrust::default_random_engine rng =
+            makeSeededRandomEngine(iter, index, CAMERA_RNG_DEPTH);
+        thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        sampleX += u01(rng);
+        sampleY += u01(rng);
+#endif
+
         segment.ray.direction = glm::normalize(cam.view
-            - cam.right * cam.pixelLength.x * ((float)x - (float)cam.resolution.x * 0.5f)
-            - cam.up * cam.pixelLength.y * ((float)y - (float)cam.resolution.y * 0.5f)
+            - cam.right * cam.pixelLength.x * (sampleX - (float)cam.resolution.x * 0.5f)
+            - cam.up * cam.pixelLength.y * (sampleY - (float)cam.resolution.y * 0.5f)
         );
 
         segment.pixelIndex = index;
