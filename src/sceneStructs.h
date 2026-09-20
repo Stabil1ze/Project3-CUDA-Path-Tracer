@@ -95,6 +95,11 @@ struct PathSegment
     glm::vec3 color;
     int pixelIndex;
     int remainingBounces;
+    // 1 when an emitter hit by this path segment must be added to the image.
+    // Direct light sampling delivers the light for a diffuse vertex, so the path
+    // hit that follows it must not be counted a second time; a delta BSDF cannot
+    // be sampled towards a light, so its emitters are still counted by the path.
+    int countsEmission;
 };
 
 // Use with a corresponding PathSegment to do:

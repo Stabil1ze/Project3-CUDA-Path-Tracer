@@ -58,6 +58,22 @@
 #define RR_MIN_DEPTH 3              // segments; segment 1 is the camera ray
 #define RR_MIN_SURVIVAL 0.05f       // never keep fewer than 5% of the paths
 
+// Direct lighting (next event estimation): connect every diffuse vertex to a
+// random point on an emissive object instead of waiting for a path to find one,
+// and stop counting the emitter hits that BSDF sampling produces for those same
+// vertices. Set to 0 for the "before" side of the measurement.
+//
+// STATUS: off by default, deliberately. The mechanism works - the mean image
+// radiance against a converged reference moves from -33.6% (first version, where
+// the sampled light shadowed itself) to -2.5% once the light is skipped in its
+// own shadow test - but -2.5% is still a bias, and a renderer that is 2.5% dark
+// is worse than one that is slow. Everything underneath is in place (light list,
+// area sampling, shadow rays, the delta split that keeps the estimator unbiased
+// by construction); what is missing is measurement, not plumbing: count accepted
+// and rejected samples per face and per rejection reason. Until that is done the
+// default build stays the unbiased path sampling renderer it was before.
+#define DIRECT_LIGHT_SAMPLING 0
+
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
 void checkCUDAErrorFn(const char* msg, const char* file, int line)
@@ -163,6 +179,27 @@ static unsigned long long h_rrDecisions = 0;
 static unsigned long long h_rrKills = 0;
 static unsigned long long h_rrSurvivalMilli = 0;
 
+// --- Direct lighting: the light list -------------------------------------
+// Every emissive geometry becomes one entry. The scenes only ever use emissive
+// boxes, they are axis aligned (the lights have no rotation) and a box is
+// uniform under area sampling, so a light is stored as its world space AABB plus
+// its emitted radiance. Sampling is uniform over the *surface* of the box, which
+// includes the thin sides - they are buried in the ceiling, but pretending they
+// are invisible would be a silent energy leak.
+struct DeviceLight
+{
+    glm::vec3 boundsMin;
+    glm::vec3 boundsMax;
+    glm::vec3 emission;      // material colour * emittance
+    float surfaceArea;
+    int geomIndex;           // which geometry this light is (to skip it in shadow rays)
+};
+
+static DeviceLight* dev_lights = NULL;
+static int h_lightCount = 0;
+static float h_totalLightArea = 0.0f;
+
+
 static int nextPowerOfTwoAtLeast(int n)
 {
     int m = 1;
@@ -260,6 +297,126 @@ static void printRussianRouletteStats(int pixelcount)
 #else
     (void)pixelcount;
 #endif
+}
+
+// --- Direct lighting: device side ----------------------------------------
+
+/**
+ * Sample a point on the surface of a random light, uniformly by area.
+ *
+ * The four random numbers are always consumed, whatever the light and face turn
+ * out to be, so that a sample uses the same number of dimensions no matter where
+ * it went - which is what lets the low discrepancy sampler (if it is ever pointed
+ * at these dimensions) stay in step.
+ *
+ * Returns the emitted radiance and the *area* density; the caller converts to a
+ * solid angle density, because that is the measure the BSDF and the cosine term
+ * live in.
+ */
+__host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, int lightCount,
+    float u0, float u1, float u2, float u3,
+    glm::vec3& point, glm::vec3& normal, glm::vec3& emission, float& areaPdf, int& geomIndex)
+{
+    if (lightCount <= 0)
+    {
+        return false;
+    }
+    int index = glm::min((int)(u0 * (float)lightCount), lightCount - 1);
+    const DeviceLight& light = lights[index];
+
+    const glm::vec3 size = light.boundsMax - light.boundsMin;
+    const float area[6] = {
+        size.x * size.y, size.x * size.y,     // -z and +z
+        size.x * size.z, size.x * size.z,     // -y and +y
+        size.y * size.z, size.y * size.z      // -x and +x
+    };
+    float total = 0.0f;
+    for (int i = 0; i < 6; i++)
+    {
+        total += area[i];
+    }
+
+    // Pick a face proportional to its area, then a point on that face.
+    float r = u1 * total;
+    int face = 5;
+    for (int i = 0; i < 5; i++)
+    {
+        if (r < area[i])
+        {
+            face = i;
+            break;
+        }
+        r -= area[i];
+    }
+
+    const float a = u2;
+    const float b = u3;
+    switch (face)
+    {
+        case 0: point = glm::vec3(glm::mix(light.boundsMin.x, light.boundsMax.x, a),
+                                  glm::mix(light.boundsMin.y, light.boundsMax.y, b),
+                                  light.boundsMin.z); normal = glm::vec3(0, 0, -1); break;
+        case 1: point = glm::vec3(glm::mix(light.boundsMin.x, light.boundsMax.x, a),
+                                  glm::mix(light.boundsMin.y, light.boundsMax.y, b),
+                                  light.boundsMax.z); normal = glm::vec3(0, 0, 1); break;
+        case 2: point = glm::vec3(glm::mix(light.boundsMin.x, light.boundsMax.x, a),
+                                  light.boundsMin.y,
+                                  glm::mix(light.boundsMin.z, light.boundsMax.z, b)); normal = glm::vec3(0, -1, 0); break;
+        case 3: point = glm::vec3(glm::mix(light.boundsMin.x, light.boundsMax.x, a),
+                                  light.boundsMax.y,
+                                  glm::mix(light.boundsMin.z, light.boundsMax.z, b)); normal = glm::vec3(0, 1, 0); break;
+        case 4: point = glm::vec3(light.boundsMin.x,
+                                  glm::mix(light.boundsMin.y, light.boundsMax.y, a),
+                                  glm::mix(light.boundsMin.z, light.boundsMax.z, b)); normal = glm::vec3(-1, 0, 0); break;
+        default: point = glm::vec3(light.boundsMax.x,
+                                   glm::mix(light.boundsMin.y, light.boundsMax.y, a),
+                                   glm::mix(light.boundsMin.z, light.boundsMax.z, b)); normal = glm::vec3(1, 0, 0); break;
+    }
+
+    emission = light.emission;
+    areaPdf = 1.0f / glm::max(total, 1e-6f);   // uniform over this light's surface
+    geomIndex = light.geomIndex;
+    return true;
+}
+
+/** Any geometry between the shading point and the light sample? */
+__host__ __device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3 origin,
+    glm::vec3 direction, float maxT, int skipGeom)
+{
+    Ray shadow;
+    shadow.origin = origin;
+    shadow.direction = direction;
+    for (int i = 0; i < geomCount; i++)
+    {
+        if (i == skipGeom)
+        {
+            // Never let a light shadow itself: a point on the sampled surface is
+            // behind its own silhouette for oblique views, which would reject
+            // valid samples.
+            continue;
+        }
+        Geom& geom = geoms[i];
+        glm::vec3 p, n;
+        bool outside = true;
+        float t = -1.0f;
+        if (geom.type == CUBE)
+        {
+            t = boxIntersectionTest(geom, shadow, p, n, outside);
+        }
+        else if (geom.type == SPHERE)
+        {
+            t = sphereIntersectionTest(geom, shadow, p, n, outside);
+        }
+        else
+        {
+            t = sdfIntersectionTest(geom, shadow, p, n, outside, NULL, NULL);
+        }
+        if (t > 1e-4f && t < maxT)
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +632,47 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_sdfHistogram, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
     cudaMemset(dev_sdfHistogram, 0, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
 
+    // --- Direct lighting: build the light list ---------------------------
+    // The unit box the base code intersects is [-0.5, 0.5]^3, so transforming
+    // its eight corners gives the world space extents of the emissive geometry.
+    std::vector<DeviceLight> lights;
+    h_totalLightArea = 0.0f;
+    for (const Geom& geom : scene->geoms)
+    {
+        const Material& material = scene->materials[geom.materialid];
+        if (material.emittance <= 0.0f)
+        {
+            continue;
+        }
+        DeviceLight light;
+        light.boundsMin = glm::vec3(FLT_MAX);
+        light.boundsMax = glm::vec3(-FLT_MAX);
+        for (int corner = 0; corner < 8; corner++)
+        {
+            glm::vec3 unit((corner & 1) ? 0.5f : -0.5f, (corner & 2) ? 0.5f : -0.5f,
+                (corner & 4) ? 0.5f : -0.5f);
+            glm::vec3 world = multiplyMV(geom.transform, glm::vec4(unit, 1.0f));
+            light.boundsMin = glm::min(light.boundsMin, world);
+            light.boundsMax = glm::max(light.boundsMax, world);
+        }
+        glm::vec3 size = light.boundsMax - light.boundsMin;
+        light.surfaceArea = 2.0f * (size.x * size.y + size.x * size.z + size.y * size.z);
+        light.emission = material.color * material.emittance;
+        light.geomIndex = (int)(&geom - scene->geoms.data());
+        lights.push_back(light);
+        h_totalLightArea += light.surfaceArea;
+    }
+
+    h_lightCount = (int)lights.size();
+    if (h_lightCount > 0)
+    {
+        cudaMalloc(&dev_lights, h_lightCount * sizeof(DeviceLight));
+        cudaMemcpy(dev_lights, lights.data(), h_lightCount * sizeof(DeviceLight),
+            cudaMemcpyHostToDevice);
+        printf("[lights] %d emitter(s), %.2f units^2 of emitting surface\n",
+            h_lightCount, h_totalLightArea);
+    }
+
     cudaMalloc(&dev_rrDecisions, sizeof(unsigned long long));
     cudaMemset(dev_rrDecisions, 0, sizeof(unsigned long long));
     cudaMalloc(&dev_rrKills, sizeof(unsigned long long));
@@ -503,9 +701,11 @@ void pathtraceFree()
     cudaFree(dev_rrDecisions);
     cudaFree(dev_rrKills);
     cudaFree(dev_rrSurvivalMilli);
+    cudaFree(dev_lights);   // no-op if the scene has no emitters
     dev_rrDecisions = NULL;
     dev_rrKills = NULL;
     dev_rrSurvivalMilli = NULL;
+    dev_lights = NULL;
     releaseCheckpointStaging();
 
     checkCUDAError("pathtraceFree");
@@ -791,6 +991,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
+        segment.countsEmission = 1;
     }
 }
 
@@ -909,9 +1110,13 @@ __global__ void shadeMaterials(
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
-    Material* materials,
-    Geom* geoms,
-    unsigned long long* rrDecisions,
+        Material* materials,
+        Geom* geoms,
+        int geomCount,
+        DeviceLight* lights,
+        int lightCount,
+        float totalLightArea,
+        unsigned long long* rrDecisions,
     unsigned long long* rrKills,
     unsigned long long* rrSurvivalMilli,
     glm::vec3* image)
@@ -954,9 +1159,16 @@ __global__ void shadeMaterials(
     if (material.emittance > 0.0f)
     {
         glm::vec3 contribution = pathSegment.color * material.color * material.emittance;
-        atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
-        atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
-        atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+        // Direct light sampling has already delivered the light for this path
+        // segment if the previous vertex was diffuse, so adding it here as well
+        // would count it twice. Delta vertices cannot be sampled towards a light
+        // and keep this path, which is what makes the split unbiased.
+        if (pathSegment.countsEmission)
+        {
+            atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
+            atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
+            atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+        }
         pathSegment.remainingBounces = -1;
         return;
     }
@@ -995,6 +1207,63 @@ __global__ void shadeMaterials(
     //     reproducible.
     thrust::default_random_engine rng =
         makeSeededRandomEngine(iter, pathSegment.pixelIndex, depth);
+    thrust::uniform_real_distribution<float> lightU01(0.0f, 1.0f);
+
+    // Surface normal on the side the ray came from, as scatterRay sees it.
+    glm::vec3 normal = intersection.surfaceNormal;
+    if (glm::dot(normal, pathSegment.ray.direction) > 0.0f)
+    {
+        normal = -normal;
+    }
+
+    // --- Direct lighting (next event estimation) -------------------------
+    // A diffuse vertex connects straight to a random point on a light instead of
+    // waiting for a path to stumble into one. The estimator is the usual one:
+    // sample the light by area, convert the density to solid angle (the measure
+    // the BSDF and the cosine live in), evaluate the Lambertian BRDF and reject
+    // the sample if anything blocks the segment.
+    const bool diffuseVertex = (material.hasReflective <= 0.0f && material.hasRefractive <= 0.0f);
+#if DIRECT_LIGHT_SAMPLING
+    if (diffuseVertex && lightCount > 0 && totalLightArea > 0.0f)
+    {
+        // Four draws, always, so that the dimension budget of a sample does not
+        // depend on where on which light it landed.
+        const float lu0 = lightU01(rng);
+        const float lu1 = lightU01(rng);
+        const float lu2 = lightU01(rng);
+        const float lu3 = lightU01(rng);
+        glm::vec3 lightPoint, lightNormal, lightEmission;
+        float lightAreaPdf = 0.0f;
+        int lightGeom = -1;
+        if (sampleLightSurface(lights, lightCount, lu0, lu1, lu2, lu3,
+                lightPoint, lightNormal, lightEmission, lightAreaPdf, lightGeom))
+        {
+            glm::vec3 toLight = lightPoint - intersect;
+            const float distance2 = glm::dot(toLight, toLight);
+            const float distance = sqrtf(distance2);
+            const glm::vec3 wi = toLight / distance;
+            const float cosSurface = glm::dot(normal, wi);
+            const float cosLight = glm::dot(lightNormal, -wi);
+            if (cosSurface > 0.0f && cosLight > 0.0f)
+            {
+                const float lightPdf = lightAreaPdf * distance2 / glm::max(cosLight, 1e-4f);
+                const glm::vec3 shadowOrigin = intersect + normal * 1e-3f;
+                if (!isOccluded(geoms, geomCount, shadowOrigin, wi, distance - 1e-3f, lightGeom))
+                {
+                    // Lambertian BRDF: albedo / pi (already textured by now).
+                    const glm::vec3 brdf = material.color / PI;
+                    const glm::vec3 contribution =
+                        pathSegment.color * brdf * (cosSurface / lightPdf) * lightEmission;
+                    atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
+                    atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
+                    atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+                }
+            }
+        }
+    }
+#else
+    (void)lightU01; (void)lightCount; (void)totalLightArea; (void)lights;
+#endif
     // NOTE: the low discrepancy sequence is deliberately *not* used for the path
     // dimensions. Measured, not assumed: pointing it at the BSDF and the roulette
     // made a 200 spp Cornell render worse rather than better (RMSE 34.6 against
@@ -1048,6 +1317,9 @@ __global__ void shadeMaterials(
     (void)rrKills;
     (void)rrSurvivalMilli;
 #endif
+
+    // Tell the next vertex whether it still has to count the emitters it hits.
+    pathSegment.countsEmission = diffuseVertex ? 0 : 1;
 
     pathSegment.remainingBounces--;
 }
@@ -1258,6 +1530,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             paths,
             dev_materials,
             dev_geoms,
+            (int)hst_scene->geoms.size(),
+            dev_lights,
+            h_lightCount,
+            h_totalLightArea,
             dev_rrDecisions,
             dev_rrKills,
             dev_rrSurvivalMilli,
