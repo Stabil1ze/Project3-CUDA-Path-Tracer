@@ -14,6 +14,7 @@
 #include "utilities.h"
 #include "intersections.h"
 #include "interactions.h"
+#include "../stream_compaction/efficient.h"   // Project 2 work-efficient scan
 
 #define ERRORCHECK 1
 
@@ -21,6 +22,12 @@
 // of every pixel inside its pixel area. Set to 0 to reproduce the aliased
 // "before" images for the write-up; 1 is the default.
 #define STOCHASTIC_AA 1
+
+// Stream compaction (Part 1 core feature): after every bounce, remove the
+// terminated paths from the working arrays so that later bounces only launch
+// threads for rays that are still alive. Set to 0 to measure the baseline that
+// keeps dead rays in the arrays and just skips them.
+#define STREAM_COMPACTION 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
 #define checkCUDAError(msg) checkCUDAErrorFn(msg, FILENAME, __LINE__)
@@ -86,6 +93,51 @@ static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 
+// Double buffers used by stream compaction: compaction scatters into the "alt"
+// arrays and the two pairs are swapped afterwards (scattering in place would
+// race, since element i moves to a slot another thread may not have read yet).
+static PathSegment* dev_pathsAlt = NULL;
+static ShadeableIntersection* dev_intersectionsAlt = NULL;
+static int* dev_alive = NULL;          // predicate: 1 = keep, 0 = terminated
+static int* dev_scanIndices = NULL;    // exclusive prefix sum of the predicate
+static int h_scanCapacity = 0;         // elements allocated for dev_scanIndices
+
+// Per-bounce ray counts for the README analysis ("number of unterminated rays
+// after each bounce"). Ray termination does not depend on whether compaction is
+// enabled - the same rays die at the same bounce - so one profile describes
+// both configurations; only the amount of work differs.
+static const int MAX_PROFILE_DEPTH = 64;
+static long long h_bounceAlive[MAX_PROFILE_DEPTH];
+static long long h_firstIterAlive[MAX_PROFILE_DEPTH];
+static long long h_profileIters = 0;
+
+static int nextPowerOfTwoAtLeast(int n)
+{
+    int m = 1;
+    while (m < n)
+    {
+        m <<= 1;
+    }
+    return m;
+}
+
+static void printBounceProfile(const char* tag, const long long* counts, int segments, long long divisor, int pixelcount)
+{
+    if (divisor <= 0)
+    {
+        return;
+    }
+
+    printf("[profile] %s", tag);
+    for (int i = 0; i < segments && i < MAX_PROFILE_DEPTH; i++)
+    {
+        long long alive = counts[i] / divisor;
+        printf(" b%d=%lld(%.1f%%)", i + 1, alive,
+            100.0 * (double)alive / (double)pixelcount);
+    }
+    printf("\n");
+}
+
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
     guiData = imGuiData;
@@ -112,6 +164,20 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
+    // Buffers for the stream compaction stage (see compactPaths below).
+    h_scanCapacity = nextPowerOfTwoAtLeast(pixelcount + 1);   // +1 so the scan also yields the total
+    cudaMalloc(&dev_pathsAlt, pixelcount * sizeof(PathSegment));
+    cudaMalloc(&dev_intersectionsAlt, pixelcount * sizeof(ShadeableIntersection));
+    cudaMalloc(&dev_alive, pixelcount * sizeof(int));
+    cudaMalloc(&dev_scanIndices, h_scanCapacity * sizeof(int));
+
+    h_profileIters = 0;
+    for (int i = 0; i < MAX_PROFILE_DEPTH; i++)
+    {
+        h_bounceAlive[i] = 0;
+        h_firstIterAlive[i] = 0;
+    }
+
     checkCUDAError("pathtraceInit");
 }
 
@@ -119,9 +185,13 @@ void pathtraceFree()
 {
     cudaFree(dev_image);  // no-op if dev_image is null
     cudaFree(dev_paths);
+    cudaFree(dev_pathsAlt);
     cudaFree(dev_geoms);
     cudaFree(dev_materials);
     cudaFree(dev_intersections);
+    cudaFree(dev_intersectionsAlt);
+    cudaFree(dev_alive);
+    cudaFree(dev_scanIndices);
 
     checkCUDAError("pathtraceFree");
 }
@@ -277,15 +347,17 @@ __global__ void computeIntersections(
 //                                       will use later on)
 //
 // Every terminated path has a zero throughput unless it ended on an emitter, in
-// which case the throughput *is* the radiance it picked up, so finalGather can
-// stay a blind `image[pixelIndex] += color` over the whole array.
+// which case the throughput *is* the radiance it picked up. That keeps
+// finalGather a blind `image[pixelIndex] += color` over the whole array until
+// stream compaction is wired in.
 __global__ void shadeMaterials(
     int iter,
     int depth,
     int num_paths,
     ShadeableIntersection* shadeableIntersections,
     PathSegment* pathSegments,
-    Material* materials)
+    Material* materials,
+    glm::vec3* image)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths)
@@ -315,12 +387,19 @@ __global__ void shadeMaterials(
 
     Material material = materials[intersection.materialId];
 
-    // (2) Ray hit an emitter. This is where radiance finally enters the path:
-    //     fold the emitted radiance into the throughput and terminate, since
-    //     the ideal emitter neither reflects nor transmits what hits it.
+    // (2) Ray hit an emitter. This is where radiance enters the image: add the
+    //     weighted emission straight into the pixel accumulator and terminate
+    //     (an ideal emitter neither reflects nor transmits what hits it).
+    //
+    //     Accumulating here rather than in a final gather over the path array is
+    //     what makes stream compaction legal: terminated paths are removed from
+    //     the arrays, so no later pass may depend on them still being there.
     if (material.emittance > 0.0f)
     {
-        pathSegment.color *= material.color * material.emittance;
+        glm::vec3 contribution = pathSegment.color * material.color * material.emittance;
+        atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
+        atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
+        atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
         pathSegment.remainingBounces = -1;
         return;
     }
@@ -351,15 +430,103 @@ __global__ void shadeMaterials(
 }
 
 // Add the current iteration's output to the overall image
-__global__ void finalGather(int nPaths, glm::vec3* image, PathSegment* iterationPaths)
-{
-    int index = (blockIdx.x * blockDim.x) + threadIdx.x;
+// NOTE: the original base code accumulated here with a "finalGather" pass over
+// the path array. That is incompatible with stream compaction (terminated paths
+// - which are exactly the ones that carry radiance - have already been removed
+// from the array by then), so the contribution is now added by shadeMaterials
+// at the moment a ray hits an emitter. `image` still holds the running sum of
+// the samples, which is what sendImageToPBO / saveImage divide by `iter`.
 
-    if (index < nPaths)
+// ---------------------------------------------------------------------------
+// Stream compaction (Project 2 implementation, driven from here)
+// ---------------------------------------------------------------------------
+
+// Predicate: 1 = path may still do something (scatter, or still see an emitter
+// because it is on its last segment), 0 = terminated and can be removed.
+__global__ void kernMarkAlivePaths(int n, int* alive, const PathSegment* paths)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n)
     {
-        PathSegment iterationPath = iterationPaths[index];
-        image[iterationPath.pixelIndex] += iterationPath.color;
+        alive[index] = (paths[index].remainingBounces < 0) ? 0 : 1;
     }
+}
+
+// Scatter the surviving paths with the prefix-sum indices computed from the
+// predicate. PathSegments and ShadeableIntersections are mirrored arrays, so
+// they are compacted with the same index map to stay in sync.
+__global__ void kernScatterAlivePaths(
+    int n, PathSegment* odata, const PathSegment* idata, const int* alive, const int* indices)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n && alive[index])
+    {
+        odata[indices[index]] = idata[index];
+    }
+}
+
+__global__ void kernScatterAliveIntersections(
+    int n, ShadeableIntersection* odata, const ShadeableIntersection* idata,
+    const int* alive, const int* indices)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n && alive[index])
+    {
+        odata[indices[index]] = idata[index];
+    }
+}
+
+/**
+ * Remove the terminated paths from the working arrays.
+ *
+ * map -> scan -> scatter:
+ *   1. kernMarkAlivePaths       builds the 1/0 predicate
+ *   2. StreamCompaction::Efficient::scanDevice  (Project 2 work-efficient
+ *      Blelloch scan) turns it into exclusive prefix-sum indices
+ *   3. kernScatterAlive*        moves the survivors into the destination arrays
+ *
+ * Returns the number of surviving paths.
+ */
+static int compactPaths(
+    int numPaths,
+    PathSegment* paths,
+    PathSegment* pathsOut,
+    ShadeableIntersection* intersections,
+    ShadeableIntersection* intersectionsOut)
+{
+    const int blockSize = 128;
+    const dim3 blocks((numPaths + blockSize - 1) / blockSize);
+
+    // 1) predicate
+    kernMarkAlivePaths<<<blocks, blockSize>>>(numPaths, dev_alive, paths);
+    checkCUDAError("compact: mark alive paths");
+
+    // 2) scan input. The scan runs in place on a power-of-two array with a
+    //    zeroed tail (a requirement of the Project 2 scan), and the extra slot
+    //    at [numPaths] ends up holding the total number of survivors.
+    int m = nextPowerOfTwoAtLeast(numPaths + 1);
+    if (m > h_scanCapacity)
+    {
+        m = h_scanCapacity;
+    }
+    cudaMemcpy(dev_scanIndices, dev_alive, numPaths * sizeof(int), cudaMemcpyDeviceToDevice);
+    cudaMemset(dev_scanIndices + numPaths, 0, (m - numPaths) * sizeof(int));
+    checkCUDAError("compact: prepare scan input");
+
+    StreamCompaction::Efficient::scanDevice(m, dev_scanIndices);
+    checkCUDAError("compact: scan");
+
+    // 3) scatter both mirrored arrays with the same indices
+    kernScatterAlivePaths<<<blocks, blockSize>>>(numPaths, pathsOut, paths, dev_alive, dev_scanIndices);
+    kernScatterAliveIntersections<<<blocks, blockSize>>>(
+        numPaths, intersectionsOut, intersections, dev_alive, dev_scanIndices);
+    checkCUDAError("compact: scatter");
+
+    // 4) number of survivors = exclusive prefix sum at [numPaths]
+    int numAlive = 0;
+    cudaMemcpy(&numAlive, dev_scanIndices + numPaths, sizeof(int), cudaMemcpyDeviceToHost);
+    checkCUDAError("compact: read survivor count");
+    return numAlive;
 }
 
 /**
@@ -423,12 +590,21 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     int depth = 0;
     int num_paths = pixelcount;
 
+    // Working arrays. With stream compaction the two pairs ping-pong: the
+    // survivors are scattered into the alternate arrays, which become the input
+    // of the next bounce. Without compaction the pointers never move and dead
+    // rays are simply skipped inside the kernels.
+    PathSegment* paths = dev_paths;
+    PathSegment* pathsOther = dev_pathsAlt;
+    ShadeableIntersection* intersections = dev_intersections;
+    ShadeableIntersection* intersectionsOther = dev_intersectionsAlt;
+
     // --- PathSegment Tracing Stage ---
     // Shoot ray into scene, bounce between objects, push shading chunks
 
-    // TODO: stream compaction - drop the paths that terminated instead of
-    // skipping them in the kernels, and stop as soon as none are left.
-    while (depth < maxSegments)
+    // The loop stops when the segment budget is used up, or - with stream
+    // compaction - as soon as every path of this iteration has terminated.
+    while (depth < maxSegments && num_paths > 0)
     {
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
 
@@ -436,39 +612,73 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         computeIntersections<<<numblocksPathSegmentTracing, blockSize1d>>> (
             depth,
             num_paths,
-            dev_paths,
+            paths,
             dev_geoms,
             hst_scene->geoms.size(),
-            dev_intersections
+            intersections
         );
         checkCUDAError("trace one bounce");
 
         // --- Shading Stage ---
-        // Evaluate the BSDF of the hit material and generate the next ray for
-        // each still-living path segment.
+        // Evaluate the BSDF of the hit material, accumulate the contribution of
+        // emitter hits into dev_image and generate the next ray for each
+        // still-living path segment.
         // TODO: compare between directly shading the path segments and shading
         // path segments that have been reshuffled to be contiguous in memory.
         shadeMaterials<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
             depth,
             num_paths,
-            dev_intersections,
-            dev_paths,
-            dev_materials
+            intersections,
+            paths,
+            dev_materials,
+            dev_image
         );
         checkCUDAError("shade one bounce");
 
         depth++;
 
+#if STREAM_COMPACTION
+        // Drop the terminated paths so the next bounce only launches threads
+        // for rays that can still reach a light.
+        num_paths = compactPaths(num_paths, paths, pathsOther, intersections, intersectionsOther);
+        {
+            PathSegment* tmpPaths = paths;
+            paths = pathsOther;
+            pathsOther = tmpPaths;
+            ShadeableIntersection* tmpIntersections = intersections;
+            intersections = intersectionsOther;
+            intersectionsOther = tmpIntersections;
+        }
+#endif
+
         if (guiData != NULL)
         {
             guiData->TracedDepth = depth;
         }
+
+        // README instrumentation: rays still processed after this bounce. With
+        // compaction this is the number of unterminated rays; without it, it
+        // stays at the full pixel count even though most rays are already dead.
+        if (depth <= MAX_PROFILE_DEPTH)
+        {
+            h_bounceAlive[depth - 1] += num_paths;
+        }
     }
 
-    // Assemble this iteration and apply it to the image
-    dim3 numBlocksPixels = (pixelcount + blockSize1d - 1) / blockSize1d;
-    finalGather<<<numBlocksPixels, blockSize1d>>>(num_paths, dev_image, dev_paths);
+    // README instrumentation: the per-bounce profile of a single iteration, plus
+    // the average over the whole render.
+    h_profileIters++;
+    if (iter == 1)
+    {
+        printBounceProfile("iteration 1 - paths processed after each bounce:",
+            h_bounceAlive, maxSegments, 1, pixelcount);
+    }
+    if (iter >= hst_scene->state.iterations)
+    {
+        printBounceProfile("average over all iterations - paths processed after each bounce:",
+            h_bounceAlive, maxSegments, h_profileIters, pixelcount);
+    }
 
     ///////////////////////////////////////////////////////////////////////////
 
