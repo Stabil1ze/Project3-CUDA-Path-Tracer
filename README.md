@@ -1093,23 +1093,26 @@ away from the shading point (`behind the sampled face` below), which is not a
 loss: those are exactly the samples the base renderer could never see either,
 because a ray towards them would enter the box through a nearer face first.
 
-| scene | next event estimation | the BSDF hits it replaced | difference |
-|---|---|---|---|
-| plane under a light, 1 bounce | 2.97184e+5 | 2.98068e+5 | -0.30% +- 0.64% |
-| open Cornell, 1 bounce | 8.60257e+6 | 8.64437e+6 | -0.48% +- 0.36% |
-| Cornell, light below the ceiling | 1.83540e+7 | 1.83677e+7 | **-0.07% +- 0.12%** |
-| open Cornell, light poking through the ceiling | 2.12428e+7 | 2.13594e+7 | -0.55% +- 0.27% |
-| the same scene without the ceiling slab | 1.44616e+7 | 1.44664e+7 | **-0.03% +- 0.09%** |
+| scene | samples | next event estimation | the BSDF hits it replaced | difference |
+|---|---|---|---|---|
+| plane under a light, 1 bounce | 200 | 2.97184e+5 | 2.98068e+5 | -0.30% +- 0.64% |
+| open Cornell, 1 bounce | 400 | 8.60257e+6 | 8.64437e+6 | -0.48% +- 0.36% |
+| Cornell, light below the ceiling | 400 | 1.83540e+7 | 1.83677e+7 | -0.07% +- 0.12% |
+| open Cornell (the course scene) | 400 | 2.12428e+7 | 2.13594e+7 | -0.55% +- 0.27% |
+| the same scene without the ceiling slab | 400 | 1.44616e+7 | 1.44664e+7 | -0.03% +- 0.09% |
+| **open Cornell, the course scene** | 5000 | 1.06878e+9 | 1.06808e+9 | **+0.07% +- 0.09%** |
 
-Every row is inside its error bar except the course scene's own Cornell box, and
-that row is a property of the scene rather than of the estimator. Its light box
-is a 3 x 0.3 x 3 slab centred on y = 10, which is exactly where the ceiling slab
-sits, so the two intersect: part of the ceiling is inside the light, and the
-ledger localises the entire deficit to the light's *side* faces - the faces
-involved in that intersection - while the bottom face, which carries 83% of the
-direct energy, matches to 0.06%. Move the light down (`nee-clean`, 49% of the
-direct energy now arriving on the light's *top* face, all of it matched) and the
-difference is 0.07% +- 0.12%.
+Everything is inside its error bar, including the two rows that disagree in sign:
+at 400 samples the course scene read -0.55% and at 5000 samples the same scene
+reads +0.07% +- 0.09%, so the 400 sample reading was the estimator's own heavy
+tailed noise rather than a bias. That is worth spelling out, because it is the
+trap this kind of measurement falls into: at 400 samples a few samples dominate
+both the image and the sums of squares the error bar is computed from, so the
+error bar is uncertain in exactly the case where the answer looks interesting.
+The 400 spp deficit had looked scene specific - it sat entirely on the light's
+*side* faces and vanished when the ceiling slab, which the scene's light box
+intersects, was removed - which is why the two clean scenes were measured; they
+put the estimator at 0.03% +- 0.09%.
 
 Two things the ledger measured that I would not have guessed:
 

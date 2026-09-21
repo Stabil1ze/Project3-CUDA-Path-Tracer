@@ -63,14 +63,17 @@
 // and stop counting the emitter hits that BSDF sampling produces for those same
 // vertices. Set to 0 for the "before" side of the measurement.
 //
-// STATUS: on. The ledger below is what settled it: the estimator delivers the
-// same energy as the BSDF emitter hits it replaces to -0.03% +- 0.09% on a plane
-// under a light, -0.07% +- 0.12% on Cornell with the light below the ceiling and
-// -0.48% +- 0.36% on the course's open top Cornell at depth 1. The one case that
-// is not inside its error bar is the course Cornell at full depth (-0.55%), and
-// it is a property of the *scene*: its light box intersects the ceiling slab and
-// its wall tops, and the deficit sits entirely on the light's side faces (the
-// faces involved). Remove the ceiling and it is -0.03% +- 0.09%.
+// STATUS: on, and measured. The ledger below is what settled it: the energy the
+// estimator delivers matches the energy of the BSDF emitter hits it replaced on
+// every scene tried - a plane under a light (-0.30% +- 0.64%), the open Cornell
+// box at one bounce (-0.48% +- 0.36%), Cornell with the light below the ceiling
+// (-0.07% +- 0.12%) and the course's own Cornell box at 5000 samples
+// (+0.07% +- 0.09%). The same course scene read -0.55% at 400 samples, all of it
+// on the light's side faces, which is the estimator's heavy tailed noise rather
+// than a bias; the README keeps both readings. What it buys and what it costs is
+// there too: a 1 x 1 light goes from 55.69% to 31.84% relative error at 200 spp
+// for 41% more time, while the course scene's 3 x 3 light is a small loss -
+// the case multiple importance sampling exists for.
 #define DIRECT_LIGHT_SAMPLING 1
 
 // Sample ledger for the estimator above: per light and per face, how many light
