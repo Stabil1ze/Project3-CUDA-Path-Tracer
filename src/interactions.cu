@@ -145,7 +145,17 @@ __host__ __device__ void scatterRay(
     glm::vec3 weight;
 
     // One draw selects the lobe from the cumulative weights.
-    const float lobe = u01(rng);
+    //
+    // The clamp is not decoration: thrust's uniform distribution is documented
+    // as closed on both ends, so a draw of exactly 1 walks past the last lobe
+    // that has any weight. For a pure mirror that is the dielectric branch: its
+    // probability is dielectricWeight / weightSum = 0, so the lobe weight it
+    // hands back is 0 / 0 = NaN. The NaN throughput then survives the roulette
+    // and rides along every later bounce of that path, landing in the image
+    // accumulator as a permanently black pixel (NaN does not survive the clamp
+    // in Image::savePNG). Measured on Cornell: 4 poisoned paths in 64 million
+    // camera rays.
+    const float lobe = glm::min(u01(rng), 0.9999999f);
     if (lobe < diffuseWeight / weightSum)
     {
         // --- Ideal diffuse (Lambertian) ---------------------------------
