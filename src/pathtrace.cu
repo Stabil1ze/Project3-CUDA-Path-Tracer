@@ -1263,6 +1263,7 @@ __global__ void shadeMaterials(
     }
 #else
     (void)lightU01; (void)lightCount; (void)totalLightArea; (void)lights;
+    (void)diffuseVertex;
 #endif
     // NOTE: the low discrepancy sequence is deliberately *not* used for the path
     // dimensions. Measured, not assumed: pointing it at the BSDF and the roulette
@@ -1318,8 +1319,20 @@ __global__ void shadeMaterials(
     (void)rrSurvivalMilli;
 #endif
 
+#if DIRECT_LIGHT_SAMPLING
     // Tell the next vertex whether it still has to count the emitters it hits.
+    // A diffuse vertex was already connected to a light by the estimator above,
+    // so its BSDF rays must not add the same light again; a delta vertex cannot
+    // be sampled towards a light at all, so it keeps counting them.
     pathSegment.countsEmission = diffuseVertex ? 0 : 1;
+#else
+    // Without the estimator nothing was connected to a light, so every emitter
+    // hit still has to be counted. Leaving this assignment unconditional deletes
+    // the light from every path that leaves a diffuse surface: measured on
+    // Cornell, the default build rendered a mean radiance of 0.0168 instead of
+    // 0.1385, i.e. 88% of the image.
+    pathSegment.countsEmission = 1;
+#endif
 
     pathSegment.remainingBounces--;
 }
