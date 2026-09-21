@@ -40,6 +40,7 @@ procedural shapes and textures.
 | 13 | Refraction: a smooth dielectric BSDF with Schlick Fresnel, total internal reflection and the radiance scaling of a refractive interface | `src/interactions.cu`, `src/scene.cpp` |
 | 14 | Glossy specular: a GGX microfacet lobe with Smith masking-shadowing and importance sampling of the visible normal distribution | `src/ggx.h`, `src/interactions.cu` |
 | 15 | Low-discrepancy sampling: a scrambled Halton sequence for the pixel area and the lens, kept off the path dimensions after measuring both | `src/sampling.h`, `src/pathtrace.cu` |
+| 16 | Direct light sampling (next event estimation): every diffuse vertex is connected to a random point on the surface of a random light, with a shadow ray and a ledger that measures what the estimator delivers against what it replaced | `src/pathtrace.cu` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -1038,6 +1039,137 @@ would let the path dimensions use it too; that is the standard fix for exactly t
 failure measured above. Correlated multi-jittered sampling (Kensler 2013) is the
 stronger alternative for the pixel area specifically, since it also gives blue
 noise like structure to the remaining error.
+
+### Direct lighting: sampling the light instead of hoping to hit it
+
+The renderer above only ever finds a light by accident: a diffuse bounce sprays a
+ray into the hemisphere and feels lucky if it lands on the emitter. In the closed
+Cornell box that is a 1 in 90 chance per sample, so the direct light - the part
+of the image that is not a bounce - is carried by a handful of lucky paths and
+shows up as the grain around the light. **Next event estimation** connects the
+shading point straight to the light instead:
+
+$$
+L_d(p) = \frac{1}{N}\sum_{i=1}^{N} f(p, \omega_o, \omega_i)\, L_e\, \frac{\cos\theta_s \cos\theta_l}{d^2 \, \mathrm{pdf}_A(q_i)}
+$$
+
+The light is an axis aligned emissive box, so `pathtraceInit` distils every
+emissive geometry into a `DeviceLight` (world bounds, emitted radiance, surface
+area) and `sampleLightSurface` draws a point on the surface of a random light,
+uniformly by area - a face is picked in proportion to its area, then a point on
+that face (four random numbers, always, whatever happens next, so that a sample
+uses a fixed dimension budget). The density is the union density,
+$$1/(N\cdot A)$$: forgetting the `1/N` is invisible in every one light scene and
+halves the direct light in a two light one, which is a bug this pass fixed.
+`isOccluded` then traces the shadow ray with the same intersection routines the
+tracer uses for its main rays.
+
+The part that keeps this **unbiased without multiple importance sampling** is the
+split: a diffuse vertex is handled by the estimator and stops counting the
+emitters its own rays hit, while a delta vertex (mirror or dielectric) cannot be
+connected to a light along the path and keeps counting them. The two sets are
+disjoint, so nothing is counted twice and nothing is dropped.
+
+![](img/nee.png)
+
+*Closed Cornell box, 200 samples per pixel, each panel labelled with its relative
+error against its own 6400 spp render. With a light the size of a fist in the
+ceiling (top row) the estimator replaces the grain with a smooth image; with the
+course scene's 3 x 3 light (bottom row) it does not help, for the reason below.*
+
+**How it was verified, and why that took more work than the estimator.** "Looks
+less noisy" is not evidence of an unbiased estimator, and comparing against a
+previous build is not either: clamping in `Image::savePNG` and a different random
+stream both change the two images in ways that have nothing to do with the
+integrator. So the renderer carries a **ledger** (`DIRECT_LIGHT_STATS`, printed as
+`[lights]` lines at the end of a render) that counts, per light and per face of
+each light, how many samples were drawn, how many were accepted and *why the rest
+were thrown away* - and, the part that settles it, sums the energy the estimator
+delivered against the energy of the BSDF emitter hits it replaced at those same
+vertices. Both estimate the same integral at the same vertex, so the two totals
+have to agree in expectation, and the ledger reports them with standard errors
+computed from the sums of squares. Half of all samples land on a face pointing
+away from the shading point (`behind the sampled face` below), which is not a
+loss: those are exactly the samples the base renderer could never see either,
+because a ray towards them would enter the box through a nearer face first.
+
+| scene | next event estimation | the BSDF hits it replaced | difference |
+|---|---|---|---|
+| plane under a light, 1 bounce | 2.97184e+5 | 2.98068e+5 | -0.30% +- 0.64% |
+| open Cornell, 1 bounce | 8.60257e+6 | 8.64437e+6 | -0.48% +- 0.36% |
+| Cornell, light below the ceiling | 1.83540e+7 | 1.83677e+7 | **-0.07% +- 0.12%** |
+| open Cornell, light poking through the ceiling | 2.12428e+7 | 2.13594e+7 | -0.55% +- 0.27% |
+| the same scene without the ceiling slab | 1.44616e+7 | 1.44664e+7 | **-0.03% +- 0.09%** |
+
+Every row is inside its error bar except the course scene's own Cornell box, and
+that row is a property of the scene rather than of the estimator. Its light box
+is a 3 x 0.3 x 3 slab centred on y = 10, which is exactly where the ceiling slab
+sits, so the two intersect: part of the ceiling is inside the light, and the
+ledger localises the entire deficit to the light's *side* faces - the faces
+involved in that intersection - while the bottom face, which carries 83% of the
+direct energy, matches to 0.06%. Move the light down (`nee-clean`, 49% of the
+direct energy now arriving on the light's *top* face, all of it matched) and the
+difference is 0.07% +- 0.12%.
+
+Two things the ledger measured that I would not have guessed:
+
+* **the light has to be skipped in its own shadow test.** Leaving it in costs
+  8.5 points of acceptance and **35.8% of the energy**, because
+  `boxIntersectionTest` reports its `t` in the geometry's object space and the
+  light box is scaled 3 x 0.3 x 3, so comparing that `t` against a world space
+  distance is meaningless. The samples that survive are the ones on faces the
+  shading point can see, and for a convex light the segment to such a sample
+  touches nothing but the sample itself, so there is nothing left to test.
+  `LIGHT_SKIP_SELF_IN_SHADOW 0` reproduces the broken version.
+* **the estimator was not the only thing that was wrong.** The ledger's
+  non-finite counter fired a handful of times per render. Chasing it found a
+  NaN that arrives from somewhere else entirely: `thrust::uniform_real_distribution`
+  is documented as closed on both ends, so the BSDF's lobe selection could draw
+  exactly 1, walk past the last lobe that has any weight and land in the
+  dielectric branch of a pure mirror, whose weight is then `0 / 0`. The NaN
+  throughput survived Russian roulette and every later bounce of that path, and
+  since NaN does not survive the clamp in `Image::savePNG` the pixel went
+  permanently black. That is fixed in `src/interactions.cu`.
+
+**What it is worth**: for the light that this feature exists for, the 1 x 1 light
+of `nee-small`, the relative error at 200 spp against a 6400 spp render drops
+from **55.69% to 31.84%** (a factor 1.75, i.e. the same image quality as 612 spp
+of the old estimator) and the per pixel noise from 0.0375 to 0.0224. It is not
+free: 500 spp of that scene take **8.07 s without** and **11.36 s with** (41%
+more, one shadow ray plus four random numbers per diffuse vertex; the ledger
+adds another 7% on top, which is why it is a separate switch). Paying 1.41x for
+1.75x is a 2.2x win.
+
+**What it is not worth**: with the course scene's 3 x 3 light the relative error
+actually gets slightly *worse*, 22.35% to 24.28%, and the per pixel noise from
+0.0830 to 0.1047. A light that subtends a large solid angle is the case where
+the BSDF already samples very well - and the estimator's own weaknesses show up:
+half of its samples are spent on faces the shading point cannot see, and the
+remaining half carry the `1/d^2 \cos\theta_l` variation of a large, close
+emitter. That is the textbook motivation for multiple importance sampling, which
+is the next feature and the reason this one is not a strict improvement in every
+scene.
+
+The same thing in wall clock terms, both on the closed Cornell box at 800 x 800,
+500 samples: **24.1 s** with the estimator off, **35.5 s** with it on (+47%, one
+shadow ray and four random numbers per diffuse vertex) and **38.5 s** with the
+ledger as well (+8.5% on top of that, which is why the ledger is a switch).
+
+Further: the wasteful half of the samples is the obvious thing to fix next.
+Sampling only the faces the shading point can actually see - for an axis aligned
+box, the face on the shading point's side of each axis - and dividing by the
+visible area instead of the whole surface doubles the importance of every sample
+that is kept, and for a constant integrand cuts the estimator's variance in half.
+That, plus MIS against the BSDF samples the path still takes, is the version that
+would also beat path sampling in the course scene.
+
+The estimator has one more property worth having, from the refraction section:
+without it, a path that transmits through glass can only reach a light if the
+refracted ray happens to point at it, which makes the caustics under glass a
+random walk problem. Connecting the *diffuse* vertex on the far side of the
+glass fixes the light that comes through the glass in one step, while the
+specular bounce that carries the caustic itself still cannot be connected (that
+is what photon mapping or MIS exists for).
 
 ### Validation against the reference image
 
