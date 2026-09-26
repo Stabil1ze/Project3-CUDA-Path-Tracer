@@ -1,17 +1,10 @@
 #include "interactions.h"
 
+#include "bsdf.h"
 #include "utilities.h"
 #include "ggx.h"
 
 #include <thrust/random.h>
-
-// Glossy specular (ROUGHNESS > 0) sampling strategy, for the comparison in the
-// README: 1 samples the distribution of *visible* normals (Heitz 2018, keeps the
-// grazing angle samples useful), 0 samples the plain NDF (the classic formula,
-// which throws away samples whose half vector points below the surface).
-#ifndef GLOSSY_VNDF_SAMPLING
-#define GLOSSY_VNDF_SAMPLING 1
-#endif
 
 __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
     glm::vec3 normal,
@@ -70,33 +63,6 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
 #define REFRACTION_RADIANCE_SCALING 1
 #endif
 
-/**
- * Fresnel reflectance of a smooth dielectric interface, Schlick's approximation
- * refined with the cosine of the *transmitted* angle (PBRT v3 8.2.3), which stays
- * accurate for indices of refraction far from 1.5:
- *
- *     F = F0 + (1 - F0) (1 - cos(theta_t))^5,   F0 = ((etaI - etaT)/(etaI + etaT))^2
- *
- * Snell's law gives sin(theta_t) = etaI/etaT * sin(theta_i); when that exceeds 1
- * the ray cannot leave the medium at all and the interface reflects everything
- * (total internal reflection), which this reports as F = 1.
- */
-__host__ __device__ inline float fresnelDielectricSchlick(float cosThetaI, float etaI, float etaT)
-{
-    float sinThetaTSq = (etaI * etaI) / (etaT * etaT) * (1.0f - cosThetaI * cosThetaI);
-    if (sinThetaTSq >= 1.0f)
-    {
-        return 1.0f;                                  // total internal reflection
-    }
-    float cosThetaT = sqrtf(glm::max(0.0f, 1.0f - sinThetaTSq));
-    float r0 = (etaI - etaT) / (etaI + etaT);
-    r0 = r0 * r0;
-    float x = 1.0f - cosThetaT;
-    float x2 = x * x;
-    float fresnel = r0 + (1.0f - r0) * x2 * x2 * x;    // x^5
-    return glm::clamp(fresnel, 0.0f, 1.0f);
-}
-
 __host__ __device__ void scatterRay(
     PathSegment & pathSegment,
     glm::vec3 intersect,
@@ -117,179 +83,30 @@ __host__ __device__ void scatterRay(
     // intersection tests return the normal oriented against the incoming ray, so
     // for a hit from the inside it comes back negated. Refraction swaps the
     // indices of refraction by direction, not by which way the normal happens to
-    // point, so keep the outward one around.
+    // point, so keep the outward one around for the ray origin nudge below.
     const glm::vec3 outwardNormal = entering ? normal : -normal;
 
-    // --- Pick which BSDF lobe this bounce uses ---------------------------
-    // Each lobe is weighted by how much of the surface response it carries.
-    // The lobe is chosen probabilistically and its throughput is divided by the
-    // probability of having picked it, which keeps the estimator unbiased.
-    // The weights are 0/1 for the materials the scenes use (a surface is
-    // diffuse, a mirror or a dielectric), so the sum is 1 and the division is a
-    // no-op - but the code stays correct for mixed materials such as
-    // glossy = diffuse + imperfect specular.
-    float diffuseWeight = (m.hasReflective > 0.0f || m.hasRefractive > 0.0f) ? 0.0f : 1.0f;
-    float specularWeight = m.hasReflective;
-    float dielectricWeight = m.hasRefractive;
-    float weightSum = diffuseWeight + specularWeight + dielectricWeight;
-    if (weightSum <= 0.0f)
+    // The BSDF lives in bsdf.h as the three part Sample / Eval / Pdf interface.
+    // A path only calls the sampler; the other two are for the estimator in
+    // pathtrace.cu, which evaluates the BSDF at a direction it did not sample.
+    const glm::vec3 incident = glm::normalize(pathSegment.ray.direction);
+    const BsdfSample sample = bsdfSample(m, normal, entering, incident, rng);
+
+    if (!sample.specular && !(sample.pdf > 0.0f))
     {
-        // Material with no usable lobe: fall back to a black diffuser instead
-        // of producing NaNs.
-        diffuseWeight = 1.0f;
-        weightSum = 1.0f;
+        // A degenerate sample: a half vector below the horizon, or a lobe that
+        // spiked to a delta. It has no energy and no density to divide by, so the
+        // path ends here (the same convention the inline version used).
+        pathSegment.color = glm::vec3(0.0f);
+        pathSegment.remainingBounces = -1;
+        return;
     }
 
-    thrust::uniform_real_distribution<float> u01(0.0f, 1.0f);
-    glm::vec3 direction;
-    glm::vec3 weight;
-
-    // One draw selects the lobe from the cumulative weights.
-    //
-    // The clamp is not decoration: thrust's uniform distribution is documented
-    // as closed on both ends, so a draw of exactly 1 walks past the last lobe
-    // that has any weight. For a pure mirror that is the dielectric branch: its
-    // probability is dielectricWeight / weightSum = 0, so the lobe weight it
-    // hands back is 0 / 0 = NaN. The NaN throughput then survives the roulette
-    // and rides along every later bounce of that path, landing in the image
-    // accumulator as a permanently black pixel (NaN does not survive the clamp
-    // in Image::savePNG). Measured on Cornell: 4 poisoned paths in 64 million
-    // camera rays.
-    const float lobe = glm::min(u01(rng), 0.9999999f);
-    if (lobe < diffuseWeight / weightSum)
-    {
-        // --- Ideal diffuse (Lambertian) ---------------------------------
-        // Sample the outgoing direction from a cosine-weighted hemisphere;
-        // the cosine term and the pdf cancel exactly:
-        //     BRDF = albedo / PI,  pdf = cos(theta) / PI
-        //     throughput *= BRDF * cos(theta) / pdf = albedo
-        // which is why cosine-weighted sampling is both cheap and low variance.
-        const float probability = diffuseWeight / weightSum;
-        direction = calculateRandomDirectionInHemisphere(normal, u01(rng), u01(rng));
-        weight = m.color * (diffuseWeight / probability);
-    }
-    else if (lobe < (diffuseWeight + specularWeight) / weightSum)
-    {
-        const float probability = specularWeight / weightSum;
-        const glm::vec3 incident = glm::normalize(pathSegment.ray.direction);
-        const float roughness = glm::clamp(m.specular.exponent, 0.0f, 1.0f);
-
-        if (roughness <= 0.0f)
-        {
-            // --- Perfect specular (mirror) -------------------------------
-            // The reflected direction is the only direction with a non-zero pdf
-            // (the BSDF is a delta distribution), so BRDF*cos/pdf reduces to the
-            // reflectance itself.
-            direction = glm::reflect(incident, normal);
-            weight = m.specular.color * (specularWeight / probability);
-        }
-        else
-        {
-            // --- GGX microfacet specular (glossy, roughness > 0) ---------
-            // BRDF = F * D * G / (4 cos_i cos_o), sampled by importance sampling
-            // the distribution of *visible* normals (Heitz 2018). With a half
-            // vector h drawn from that distribution the pdf of the reflected
-            // direction is
-            //     pdf = D_vis(h) / (4 (wo . h)) = G1(wo) D(h) / (4 cos_o)
-            // so the estimator collapses to
-            //     BRDF * cos_i / pdf = F * G2 / G1(wo)
-            // which is why D never has to be evaluated in the result: it cancels.
-            // (F, and therefore the material colour, still carry the energy.)
-            const float alpha = ggxAlphaFromRoughness(roughness);
-            const glm::vec3 wo = -incident;          // toward the viewer
-            const float NdotV = glm::max(glm::dot(normal, wo), 1e-4f);
-
-#if GLOSSY_VNDF_SAMPLING
-            const glm::vec3 h = ggxSampleVisibleNormal(normal, wo, alpha, u01(rng), u01(rng));
-#else
-            const glm::vec3 h = ggxSampleNormal(normal, alpha, u01(rng), u01(rng));
-#endif
-            const glm::vec3 glossyDirection = glm::reflect(incident, h);
-            const float NdotL = glm::dot(normal, glossyDirection);
-            const float NdotH = glm::dot(normal, h);
-            const float VdotH = glm::dot(wo, h);
-
-            // Half vectors below the horizon (or light below the surface) carry
-            // no energy; with the visible normal distribution this is rare, with
-            // the classic NDF sampling it is common at grazing angles.
-            if (NdotL <= 0.0f || NdotH <= 0.0f || VdotH <= 0.0f)
-            {
-                pathSegment.color = glm::vec3(0.0f);
-                pathSegment.remainingBounces = -1;
-                return;
-            }
-
-            const glm::vec3 F = fresnelSchlick(m.specular.color, VdotH);
-            const float D = ggxDistribution(NdotH, alpha);
-            const float G2 = ggxG2HeightCorrelated(NdotV, NdotL, alpha);
-            const float G1o = ggxG1(NdotV, alpha);
-#if GLOSSY_VNDF_SAMPLING
-            // pdf of the visible normal distribution, converted to the solid
-            // angle of the reflected direction
-            const float pdf = G1o * D / (4.0f * NdotV);
-#else
-            // pdf of the plain NDF sampling
-            const float pdf = D * NdotH / (4.0f * VdotH);
-#endif
-            if (pdf <= 0.0f)
-            {
-                pathSegment.color = glm::vec3(0.0f);
-                pathSegment.remainingBounces = -1;
-                return;
-            }
-
-            const glm::vec3 f = F * (D * G2 / (4.0f * NdotV * NdotL));
-            direction = glossyDirection;
-            weight = f * (NdotL / pdf) * (specularWeight / probability);
-        }
-    }
-    else
-    {
-        // --- Smooth dielectric (glass, water) ----------------------------
-        // A dielectric has exactly two delta directions: the mirror direction
-        // and the refracted one. They are chosen with the Fresnel probability,
-        // so the estimator stays unbiased for any combination of angle and
-        // index of refraction:
-        //
-        //   reflect  with probability F        -> weight F / F = 1
-        //   transmit with probability (1 - F)  -> weight (1 - F) / (1 - F) = 1
-        //
-        // and the transmitted radiance is scaled by (etaI / etaT)^2, which is the
-        // factor that makes a path entering glass and leaving it again carry the
-        // right amount of energy (PBRT v3 8.2.3).
-        const float probability = dielectricWeight / weightSum;
-        const glm::vec3 incident = glm::normalize(pathSegment.ray.direction);
-
-        glm::vec3 n = outwardNormal;
-        if (glm::dot(n, incident) > 0.0f)
-        {
-            n = -n;                                   // hit the back face
-        }
-
-        const float etaI = entering ? 1.0f : m.indexOfRefraction;
-        const float etaT = entering ? m.indexOfRefraction : 1.0f;
-        const float cosThetaI = glm::clamp(glm::dot(-incident, n), 0.0f, 1.0f);
-        const float fresnel = fresnelDielectricSchlick(cosThetaI, etaI, etaT);
-
-        if (u01(rng) < fresnel)
-        {
-            direction = glm::reflect(incident, n);
-            weight = m.color * (dielectricWeight / probability);
-        }
-        else
-        {
-            direction = glm::normalize(glm::refract(incident, n, etaI / etaT));
-#if REFRACTION_RADIANCE_SCALING
-            const float radianceScale = (etaI / etaT) * (etaI / etaT);
-#else
-            const float radianceScale = 1.0f;
-#endif
-            weight = m.color * radianceScale * (dielectricWeight / probability);
-        }
-    }
-
-    pathSegment.ray.direction = glm::normalize(direction);
-    pathSegment.color *= weight;
+    pathSegment.ray.direction = glm::normalize(sample.direction);
+    pathSegment.color *= sample.weight;
+    // How likely this direction was, for the MIS weight of a light the segment
+    // may land on (see PathSegment::lastPdf). A delta sample reports 0.
+    pathSegment.lastPdf = sample.specular ? 0.0f : sample.pdf;
 
     // Spawn the next ray from the hit point, nudged off the surface. Without
     // this the new ray can immediately re-intersect the surface it left

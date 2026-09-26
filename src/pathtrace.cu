@@ -18,6 +18,7 @@
 #include "utilities.h"
 #include "intersections.h"
 #include "interactions.h"
+#include "bsdf.h"
 #include "sampling.h"
 #include "../stream_compaction/efficient.h"   // Project 2 work-efficient scan
 
@@ -60,40 +61,28 @@
 
 // Direct lighting (next event estimation): connect every diffuse vertex to a
 // random point on an emissive object instead of waiting for a path to find one,
-// and stop counting the emitter hits that BSDF sampling produces for those same
-// vertices. Set to 0 for the "before" side of the measurement.
+// and MIS down the emitter hits BSDF sampling produces for those same vertices.
+// Set to 0 for the "before" side of the measurement.
 //
-// STATUS: on, and measured. The ledger below is what settled it: the energy the
-// estimator delivers matches the energy of the BSDF emitter hits it replaced on
-// every scene tried - a plane under a light (-0.30% +- 0.64%), the open Cornell
-// box at one bounce (-0.48% +- 0.36%), Cornell with the light below the ceiling
-// (-0.07% +- 0.12%) and the course's own Cornell box at 5000 samples
-// (+0.07% +- 0.09%). The same course scene read -0.55% at 400 samples, all of it
-// on the light's side faces, which is the estimator's heavy tailed noise rather
-// than a bias; the README keeps both readings. What it buys and what it costs is
-// there too: a 1 x 1 light goes from 55.69% to 31.84% relative error at 200 spp
-// for 41% more time, while the course scene's 3 x 3 light is a small loss -
-// the case multiple importance sampling exists for.
+// STATUS: on, and measured. The ledger below is what settled it - the energy the
+// estimator delivers matches the energy of the emitter hits it replaced on every
+// scene tried, all four checks within their error bars (README). It pays on a
+// small light (55.69% -> 31.84% relative error at 200 spp, +41% time) and is a
+// small loss on the course scene's 3 x 3 light, the case MIS exists for.
 #define DIRECT_LIGHT_SAMPLING 1
 
-// Sample ledger for the estimator above: per light and per face, how many light
-// samples were drawn, how many were accepted, why the rest were thrown away, and
-// how much energy the estimator delivered compared to the energy of the BSDF
-// emitter hits it replaced. That last comparison is an unbiasedness test that
-// needs no converged reference image: both numbers estimate the same integral at
-// the same vertices, so they have to agree in expectation. It costs a handful of
-// atomics per light sample, hence the separate switch - turn it off for timing.
+// Sample ledger for the estimator above: per light and per face, samples drawn,
+// accepted, why the rest were dropped, and the energy delivered against the BSDF
+// emitter hits it replaced - an unbiasedness test that needs no reference image.
+// A few atomics per light sample, hence the separate switch: off for timing.
 #define DIRECT_LIGHT_STATS 1
 
-// Is the sampled light skipped in its own shadow test? Yes, and that is the
-// measured answer, not the tidy one: skipping is what makes the estimator match
-// the renderer. The samples it keeps are the ones on the faces the shading point
-// can see (cosLight > 0), and for a convex light the segment to such a sample
-// touches nothing but the sample itself, so there is nothing to test. Leaving
-// the light in instead costs 8.5 points of acceptance and 35.8% of the energy,
-// because boxIntersectionTest reports its t in the geometry's *object* space and
-// comparing that against a world space distance is not meaningful (the light box
-// is scaled 3 x 0.3 x 3). Both numbers are in the ledger's energy check.
+// Is the sampled light skipped in its own shadow test? Yes: the kept samples sit
+// on faces the shading point can see (cosLight > 0), and for a convex light the
+// segment to such a sample touches nothing else. Leaving the light in costs 8.5
+// points of acceptance and 35.8% of the energy, because boxIntersectionTest
+// reports its t in the geometry's object space and comparing that against a world
+// space distance is not meaningful.
 #define LIGHT_SKIP_SELF_IN_SHADOW 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
@@ -215,6 +204,17 @@ struct DeviceLight
     glm::vec3 emission;      // material colour * emittance
     float surfaceArea;
     int geomIndex;           // which geometry this light is (to skip it in shadow rays)
+    // How the emitter is sampled: a box by area over its six faces, a sphere by
+    // solid angle over its tangent cone (constant density on the visible cap).
+    int shape;               // 0 = box, 1 = sphere
+    float radius;            // sphere only
+    glm::vec3 center;        // sphere only
+};
+
+enum LightShape
+{
+    LIGHT_BOX = 0,
+    LIGHT_SPHERE = 1
 };
 
 static DeviceLight* dev_lights = NULL;
@@ -223,14 +223,9 @@ static int h_lightCount = 0;
 static float h_totalLightArea = 0.0f;
 
 // --- Direct lighting: the sample ledger ----------------------------------
-// A box light is sampled face by face, and each face behaves differently: from a
-// floor point the top face is always behind the light's own horizon, the side
-// faces are thin and often grazed, and only the bottom face carries most of the
-// energy. Counting the outcomes per face is what turns "the image is 2.5% dark"
-// into a statement about which samples went missing: half of all samples land on
-// a face that points away from the shading point, and the energy the estimator
-// delivers next to the energy of the BSDF hits it replaced is the unbiasedness
-// test that needs no converged reference render.
+// Per light and per face: samples drawn, accepted, why the rest were dropped,
+// and the energy the estimator delivered against the BSDF emitter hits it
+// replaced - an unbiasedness test that needs no converged reference render.
 enum LightSampleOutcome
 {
     LIGHT_ACCEPTED = 0,
@@ -246,22 +241,17 @@ struct LightLedger
     unsigned long long rejectCosSurface;
     unsigned long long rejectCosLight;
     unsigned long long occluded;
-    // Sum over accepted samples of (r + g + b). The sum of squares is carried
-    // along so the printout can quote an error bar instead of asking the reader
-    // to trust a bare number: Var(sum) = sumSq - sum^2 / n for independent
-    // samples, and a light sample really is independent per pixel.
+    // Accepted samples of (r + g + b) after the MIS weight, i.e. what went into
+    // the image. The sum of squares gives the printout its error bar.
     double acceptedEnergy;
     double acceptedEnergySq;
-    // Samples whose contribution was inf or NaN. A double accumulator cannot
-    // absorb one of those (it poisons every later addition and the ledger prints
-    // as "nan" from then on), so they are counted instead of summed. Any nonzero
-    // value here is a degeneracy in the geometry, not a rounding artifact.
+    // inf / NaN contributions: counted, not summed - one would poison the rest.
     unsigned long long nonFiniteEnergy;
-    // Emitter hits by random walks, i.e. exactly the radiance next event
-    // estimation replaced. Diagnostics only: with the estimator on these never
-    // reach the image.
+    // Emitter hits found by random walks: weighted energy, plain energy (the
+    // reference side of the check) and the plain sum of squares.
     unsigned long long bsdfHits;
     double bsdfEnergy;
+    double bsdfEnergyPlain;
     double bsdfEnergySq;
 };
 
@@ -285,6 +275,7 @@ static void addLedger(LightLedger& into, const LightLedger& from)
     into.nonFiniteEnergy += from.nonFiniteEnergy;
     into.bsdfHits += from.bsdfHits;
     into.bsdfEnergy += from.bsdfEnergy;
+    into.bsdfEnergyPlain += from.bsdfEnergyPlain;
     into.bsdfEnergySq += from.bsdfEnergySq;
 }
 
@@ -408,13 +399,13 @@ static const char* lightFaceName(int face)
 static void printDirectLightStats(int pixelcount)
 {
 #if DIRECT_LIGHT_SAMPLING && DIRECT_LIGHT_STATS
-    if (dev_lightLedger == NULL || h_lightCount <= 0)
+    if (dev_lightLedger == NULL)
     {
         return;
     }
 
-    std::vector<LightLedger> perLight(h_lightCount);
-    std::vector<LightLedger> perFace((size_t)h_lightCount * LIGHT_SAMPLE_FACES);
+    std::vector<LightLedger> perLight(h_lightCount + 1);
+    std::vector<LightLedger> perFace((size_t)glm::max(h_lightCount, 1) * LIGHT_SAMPLE_FACES);
     LightLedger folded;
     cudaMemcpy(perLight.data(), dev_lightLedger, perLight.size() * sizeof(LightLedger),
         cudaMemcpyDeviceToHost);
@@ -425,7 +416,9 @@ static void printDirectLightStats(int pixelcount)
     cudaMemcpy(&foldedAbove, dev_foldedAboveLedger, sizeof(LightLedger), cudaMemcpyDeviceToHost);
 
     LightLedger total = {};
-    for (int i = 0; i < h_lightCount; i++)
+    // The last row is the distant light, which is not an area light and so has
+    // no entry in the light list.
+    for (int i = 0; i <= h_lightCount; i++)
     {
         addLedger(total, perLight[i]);
     }
@@ -465,32 +458,39 @@ static void printDirectLightStats(int pixelcount)
                 faceRow.acceptedEnergy);
         }
     }
+    {
+        const LightLedger& row = perLight[h_lightCount];
+        if (row.samples > 0)
+        {
+            printf("[lights] distant light: %llu samples, %.1f%% accepted, %.4g units of accepted "
+                "energy (rejected: horizon %llu, occluded %llu)\n",
+                row.samples,
+                100.0 * (double)row.accepted / (double)glm::max(row.samples, 1ull),
+                row.acceptedEnergy, row.rejectCosSurface, row.occluded);
+        }
+    }
 
-    // The estimator against the estimator it replaced: same integral, same
-    // vertices, so the two totals have to match in expectation. The standard
-    // errors are summed in quadrature, which is conservative - both sides are
-    // built from the same paths, so their errors are correlated and the real
-    // error bar of the difference is narrower.
+    // The estimator against the one it replaced: under MIS the direct light term
+    // is the light strategy's energy plus the weighted share of the emitter hits
+    // the paths found themselves, where a renderer without light sampling adds
+    // those hits unweighted. Same integral, same vertices, so the totals agree in
+    // expectation.
     if (folded.bsdfHits == 0 || total.accepted == 0)
     {
         printf("[lights] energy check: no samples to compare\n");
         return;
     }
-    const double nee = total.acceptedEnergy;
-    const double fold = folded.bsdfEnergy;
-    // The trial count is the number of light samples, not the number of non-zero
-    // outcomes: both sums are zero for most of their samples (a light sample that
-    // was rejected, a BSDF ray that missed the light), and dividing by the count
-    // of the surviving few makes the variance collapse to zero - the error bar
-    // would then claim a precision the renderer does not have.
+    const double nee = total.acceptedEnergy + folded.bsdfEnergy;
+    const double fold = folded.bsdfEnergyPlain;
+    // Trials are the light samples, not the non-zero outcomes: dividing by the
+    // survivors would collapse the variance to a precision we do not have.
     const double trials = (double)total.samples;
-    const double neeVar = glm::max(total.acceptedEnergySq - nee * nee / trials, 0.0);
     const double foldVar = glm::max(folded.bsdfEnergySq - fold * fold / trials, 0.0);
-    const double noise = sqrt(neeVar + foldVar);
-    printf("[lights] energy check: next event estimation %.6g (+-%.3f%% standard error) against the "
-        "%llu BSDF emitter hits it replaced %.6g (+-%.3f%%) over %.3g light samples: "
-        "%+.3f%% +- %.3f%%\n",
-        nee, 100.0 * sqrt(neeVar) / nee,
+    const double noise = sqrt(foldVar);
+    printf("[lights] energy check: the multiple importance sampling estimator %.6g (light strategy "
+        "%.6g + weighted emitter hits %.6g) against the %llu unweighted BSDF emitter hits %.6g "
+        "(+-%.3f%%) over %.3g light samples: %+.3f%% +- %.3f%%\n",
+        nee, total.acceptedEnergy, folded.bsdfEnergy,
         folded.bsdfHits, fold, 100.0 * sqrt(foldVar) / fold, trials,
         100.0 * (nee - fold) / fold, 100.0 * noise / fold);
     printf("[lights]   of the BSDF hits, %llu (%+.3f%% of their energy) came from above the "
@@ -549,30 +549,89 @@ __device__ inline void ledgerRecord(LightLedger& row, LightSampleOutcome outcome
     }
 }
 
-/** Record an emitter hit that the estimator replaced. */
-__device__ inline void ledgerRecordFolded(LightLedger& row, double energy)
+/**
+ * Record an emitter hit reached by a random walk, with the weight multiple
+ * importance sampling gave it (`weight` is 1 for a delta sample and for the
+ * renderer without light sampling, which is what makes the plain sum below the
+ * reference side of the unbiasedness check).
+ */
+__device__ inline void ledgerRecordBsdfHit(LightLedger& row, double energy,
+    double weight)
 {
     atomicAdd(&row.bsdfHits, 1ull);
-    atomicAdd(&row.bsdfEnergy, energy);
+    atomicAdd(&row.bsdfEnergy, energy * weight);
+    atomicAdd(&row.bsdfEnergyPlain, energy);
     atomicAdd(&row.bsdfEnergySq, energy * energy);
 }
 #endif
 
+/** A direction uniform in solid angle over the cone of half angle `cosMax`
+ *  around `axis`. Used by the distant light and by spherical lights. */
+__host__ __device__ inline glm::vec3 sampleCone(glm::vec3 axis, float cosMax, float u1, float u2)
+{
+    const float cosTheta = glm::mix(cosMax, 1.0f, u1);
+    const float sinTheta = sqrtf(glm::max(0.0f, 1.0f - cosTheta * cosTheta));
+    glm::vec3 t1, t2;
+    buildTangentFrame(axis, t1, t2);
+    const float phi = TWO_PI * u2;
+    return glm::normalize(t1 * (sinTheta * cosf(phi)) + t2 * (sinTheta * sinf(phi))
+        + axis * cosTheta);
+}
+
 /**
- * Sample a point on the surface of a random light, uniformly by area.
- *
- * The four random numbers are always consumed, whatever the light and face turn
- * out to be, so that a sample uses the same number of dimensions no matter where
- * it went - which is what lets the low discrepancy sampler (if it is ever pointed
- * at these dimensions) stay in step.
- *
- * Returns the emitted radiance and the *area* density; the caller converts to a
- * solid angle density, because that is the measure the BSDF and the cosine term
- * live in.
+ * Density of the light sampling strategy for a direction that reaches a point on
+ * `light`, in solid angle, including the chance of having picked that light. One
+ * definition, used by both the estimator and the MIS weights: two call sites
+ * drifting apart is how a light sampling implementation ends up silently dark.
  */
+__host__ __device__ inline float lightSampleSolidAnglePdf(const DeviceLight& light, int lightCount,
+    glm::vec3 shadingPoint, glm::vec3 lightPoint, glm::vec3 lightNormal)
+{
+    if (light.shape == LIGHT_SPHERE)
+    {
+        // Uniform over the tangent cone: constant density on the visible cap, so
+        // no 1/cos singularity and no wasted samples on the far side.
+        const glm::vec3 toCenter = light.center - shadingPoint;
+        const float distance2 = glm::dot(toCenter, toCenter);
+        const float radius2 = light.radius * light.radius;
+        if (distance2 <= radius2)
+        {
+            return 0.0f;                 // inside the emitter: no visible cap
+        }
+        const float cosMax = sqrtf(glm::max(0.0f, 1.0f - radius2 / distance2));
+        const float solidAngle = TWO_PI * (1.0f - cosMax);
+        return 1.0f / glm::max((float)lightCount * solidAngle, 1e-12f);
+    }
+
+    // Box: uniform by area, converted to the solid angle the BSDF lives in.
+    const glm::vec3 toLight = lightPoint - shadingPoint;
+    const float distance2 = glm::dot(toLight, toLight);
+    const float cosLight = glm::abs(glm::dot(lightNormal, glm::normalize(-toLight)));
+    return 1.0f / glm::max((float)lightCount * light.surfaceArea, 1e-6f)
+        * distance2 / glm::max(cosLight, 1e-4f);
+}
+
+/** Same, for a hit that has to be attributed to one of the lights by geometry. */
+__host__ __device__ inline float lightSamplePdfForGeom(const DeviceLight* lights, int lightCount,
+    glm::vec3 shadingPoint, glm::vec3 lightPoint, glm::vec3 lightNormal, int geomId)
+{
+    for (int i = 0; i < lightCount; i++)
+    {
+        if (lights[i].geomIndex == geomId)
+        {
+            return lightSampleSolidAnglePdf(lights[i], lightCount, shadingPoint, lightPoint,
+                lightNormal);
+        }
+    }
+    return 0.0f;
+}
+
+/** Sample a point on a random light: uniform by area over the six faces of a box
+ *  or over the tangent cone of a sphere. Always consumes four random numbers so
+ *  that every sample uses the same dimension budget. */
 __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, int lightCount,
-    float u0, float u1, float u2, float u3,
-    glm::vec3& point, glm::vec3& normal, glm::vec3& emission, float& areaPdf, int& geomIndex,
+    glm::vec3 shadingPoint, float u0, float u1, float u2, float u3,
+    glm::vec3& point, glm::vec3& normal, glm::vec3& emission, int& geomIndex,
     int& lightIndex, int& faceIndex)
 {
     if (lightCount <= 0)
@@ -581,6 +640,36 @@ __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, in
     }
     int index = glm::min((int)(u0 * (float)lightCount), lightCount - 1);
     const DeviceLight& light = lights[index];
+
+    if (light.shape == LIGHT_SPHERE)
+    {
+        const glm::vec3 toCenter = light.center - shadingPoint;
+        const float distance2 = glm::dot(toCenter, toCenter);
+        const float radius2 = light.radius * light.radius;
+        if (distance2 <= radius2)
+        {
+            return false;                // the shading point is inside the light
+        }
+        const glm::vec3 axis = toCenter * glm::inversesqrt(distance2);
+        const float cosMax = sqrtf(glm::max(0.0f, 1.0f - radius2 / distance2));
+        const glm::vec3 wi = sampleCone(axis, cosMax, u2, u3);
+        // Nearest intersection of that direction with the sphere: the sample
+        // point, and the normal the emitter radiates along.
+        const float b = glm::dot(wi, toCenter);
+        const float disc = b * b - (distance2 - radius2);
+        if (disc <= 0.0f)
+        {
+            return false;
+        }
+        const float t = b - sqrtf(disc);
+        point = shadingPoint + wi * t;
+        normal = glm::normalize(point - light.center);
+        emission = light.emission;
+        geomIndex = light.geomIndex;
+        lightIndex = index;
+        faceIndex = 0;
+        return true;
+    }
 
     const glm::vec3 size = light.boundsMax - light.boundsMin;
     const float area[6] = {
@@ -632,15 +721,6 @@ __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, in
     }
 
     emission = light.emission;
-    // The light is picked uniformly among all of them and the point is then
-    // uniform by area on the surface of that one light, so the density over the
-    // union of all emitting surfaces is
-    //
-    //   pdf = 1 / (lightCount * total)
-    //
-    // Forgetting the 1 / lightCount is invisible in a one light scene (every
-    // course scene) and halves the direct lighting in a two light one.
-    areaPdf = 1.0f / glm::max(total * (float)lightCount, 1e-6f);
     geomIndex = light.geomIndex;
     lightIndex = index;
     faceIndex = face;
@@ -685,6 +765,88 @@ __host__ __device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3
         }
     }
     return false;
+}
+
+// --- Multiple importance sampling -----------------------------------------
+
+/** Radiance of the environment light (the dome) in a direction: a three colour
+ *  sky, horizon-to-zenith above and ground below, blended at the horizon.
+ *  The escaping rays are what collect it, so a bright dome lights an open scene;
+ *  it deliberately has no second sampling strategy (see the README). */
+__host__ __device__ inline glm::vec3 environmentRadiance(const Environment& environment,
+    glm::vec3 direction)
+{
+    const float t = direction.y;
+    const glm::vec3 radiance = (t >= 0.0f)
+        ? glm::mix(environment.horizon, environment.zenith, glm::min(t, 1.0f))
+        : glm::mix(environment.ground, environment.horizon, glm::clamp(t + 1.0f, 0.0f, 1.0f));
+    return environment.intensity * radiance;
+}
+
+// --- The distant light (a sun) ---------------------------------------------
+
+/** Is this direction inside the distant light's disc? */
+__host__ __device__ inline bool insideDistantLight(const DistantLight& sun, glm::vec3 direction)
+{
+    return sun.enabled != 0 && glm::dot(direction, -sun.direction) >= sun.cosMaxAngle;
+}
+
+/** Density of the distant light's sampler: uniform over its disc, zero
+ *  elsewhere. The zero is what keeps MIS well behaved outside the disc. */
+__host__ __device__ inline float distantLightPdf(const DistantLight& sun, glm::vec3 direction)
+{
+    return insideDistantLight(sun, direction) ? (1.0f / glm::max(sun.solidAngle, 1e-12f)) : 0.0f;
+}
+
+/** A direction uniformly distributed over the disc's cone (uniform in solid
+ *  angle, which is what makes the density above a constant). */
+__host__ __device__ inline glm::vec3 sampleDistantLight(const DistantLight& sun, float u1, float u2)
+{
+    const glm::vec3 axis = -sun.direction;              // towards the light
+    const float cosTheta = glm::mix(sun.cosMaxAngle, 1.0f, u1);
+    const float sinTheta = sqrtf(glm::max(0.0f, 1.0f - cosTheta * cosTheta));
+    glm::vec3 t1, t2;
+    buildTangentFrame(axis, t1, t2);
+    const float phi = TWO_PI * u2;
+    return glm::normalize(t1 * (sinTheta * cosf(phi)) + t2 * (sinTheta * sinf(phi))
+        + axis * cosTheta);
+}
+
+/** How often the light strategy picks the distant light over an area light: a
+ *  fixed half when a scene has both, all of it when it has one. MIS keeps either
+ *  choice unbiased; power weighted selection is the refinement. */
+__host__ __device__ inline float distantLightSelectionChance(const DistantLight& sun,
+    int lightCount, float totalLightArea)
+{
+    const bool areaLights = (lightCount > 0 && totalLightArea > 0.0f);
+    const bool distant = sun.enabled != 0;
+    if (distant && areaLights)
+    {
+        return 0.5f;
+    }
+    return distant ? 1.0f : 0.0f;
+}
+
+/** Density of the light strategy family (area lights + the sun) for a direction.
+ *  `areaDensity` is what the area light part would produce, known by the caller
+ *  from the sample it took or the hit it is looking at - and 0 when the direction
+ *  leaves the scene, where it cannot have hit an area light. */
+__host__ __device__ inline float lightStrategyPdf(const DistantLight& sun, float sunChance,
+    float areaDensity, glm::vec3 direction)
+{
+    return (1.0f - sunChance) * areaDensity + sunChance * distantLightPdf(sun, direction);
+}
+
+/** Power heuristic (beta = 2) MIS weight:
+ *      w = pdfThis^2 / (pdfThis^2 + pdfOther^2)
+ *  Squaring makes the better strategy win faster than the balance heuristic
+ *  would (PBRT and my CG2025 HW7 both use this form). */
+__host__ __device__ inline float misWeight(float pdfThis, float pdfOther)
+{
+    const float a = pdfThis * pdfThis;
+    const float b = pdfOther * pdfOther;
+    const float sum = a + b;
+    return (sum > 0.0f) ? (a / sum) : 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -927,8 +1089,36 @@ void pathtraceInit(Scene* scene)
         light.surfaceArea = 2.0f * (size.x * size.y + size.x * size.z + size.y * size.z);
         light.emission = material.color * material.emittance;
         light.geomIndex = (int)(&geom - scene->geoms.data());
-        lights.push_back(light);
+        // A sphere is sampled over its tangent cone, so the world radius is half
+        // the scale; a non uniform scale is an ellipsoid and falls back to the
+        // box path with a warning instead of being sampled wrongly.
+        light.shape = LIGHT_BOX;
+        light.radius = 0.0f;
+        light.center = 0.5f * (light.boundsMin + light.boundsMax);
+        if (geom.type == SPHERE)
+        {
+            const glm::vec3& s = geom.scale;
+            const float biggest = glm::max(s.x, glm::max(s.y, s.z));
+            const float smallest = glm::min(s.x, glm::min(s.y, s.z));
+            if (biggest - smallest <= 1e-4f * glm::max(biggest, 1e-6f))
+            {
+                light.shape = LIGHT_SPHERE;
+                light.radius = 0.5f * biggest;
+                light.surfaceArea = 4.0f * PI * light.radius * light.radius;
+            }
+            else
+            {
+                printf("[lights] warning: sphere emitter %d is scaled (%g %g %g), i.e. an "
+                    "ellipsoid; sampling it as a box\n", light.geomIndex, s.x, s.y, s.z);
+            }
+        }
+        if (light.shape == LIGHT_SPHERE)
+        {
+            printf("[lights] emitter %d is a sphere of radius %.4g at (%.3g %.3g %.3g)\n",
+                light.geomIndex, light.radius, light.center.x, light.center.y, light.center.z);
+        }
         h_totalLightArea += light.surfaceArea;
+        lights.push_back(light);
     }
 
     h_lightCount = (int)lights.size();
@@ -940,21 +1130,25 @@ void pathtraceInit(Scene* scene)
             cudaMemcpyHostToDevice);
         printf("[lights] %d emitter(s), %.2f units^2 of emitting surface\n",
             h_lightCount, h_totalLightArea);
+    }
 #if DIRECT_LIGHT_STATS
-        cudaMalloc(&dev_lightLedger, h_lightCount * sizeof(LightLedger));
-        cudaMemset(dev_lightLedger, 0, h_lightCount * sizeof(LightLedger));
+    {
+        // One row per area light, plus one for the distant light (not a geometry,
+        // so it gets the last row instead of an entry in the light list).
+        cudaMalloc(&dev_lightLedger, (h_lightCount + 1) * sizeof(LightLedger));
+        cudaMemset(dev_lightLedger, 0, (h_lightCount + 1) * sizeof(LightLedger));
         cudaMalloc(&dev_lightFaceLedger,
-            (size_t)h_lightCount * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
+            (size_t)glm::max(h_lightCount, 1) * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
         cudaMemset(dev_lightFaceLedger, 0,
-            (size_t)h_lightCount * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
+            (size_t)glm::max(h_lightCount, 1) * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
         cudaMalloc(&dev_foldedLedger, sizeof(LightLedger));
         cudaMemset(dev_foldedLedger, 0, sizeof(LightLedger));
         cudaMalloc(&dev_foldedFaceLedger, 2 * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
         cudaMemset(dev_foldedFaceLedger, 0, 2 * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
         cudaMalloc(&dev_foldedAboveLedger, sizeof(LightLedger));
         cudaMemset(dev_foldedAboveLedger, 0, sizeof(LightLedger));
-#endif
     }
+#endif
 
     cudaMalloc(&dev_rrDecisions, sizeof(unsigned long long));
     cudaMemset(dev_rrDecisions, 0, sizeof(unsigned long long));
@@ -1285,7 +1479,9 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
-        segment.countsEmission = 1;
+        // No BSDF behind a camera ray: density 0 gives an emitter it hits the
+        // full weight (the value also marks a delta sample).
+        segment.lastPdf = 0.0f;
     }
 }
 
@@ -1410,6 +1606,8 @@ __global__ void shadeMaterials(
         DeviceLight* lights,
         int lightCount,
         float totalLightArea,
+        Environment environment,
+        DistantLight distantLight,
         LightLedger* lightLedger,
         LightLedger* lightFaceLedger,
         LightLedger* foldedLedger,
@@ -1437,10 +1635,37 @@ __global__ void shadeMaterials(
 
     ShadeableIntersection intersection = shadeableIntersections[idx];
 
-    // (1) Ray escaped the scene. The background is black, so this path
-    //     contributes nothing and is terminated.
+    // (1) Ray escaped the scene: it sees the environment light, if the scene has
+    //     one. That is the only way to find the dome - as background and as the
+    //     light of an open scene.
     if (intersection.t <= 0.0f)
     {
+        const glm::vec3 rayDirection = glm::normalize(pathSegment.ray.direction);
+        glm::vec3 radiance = environmentRadiance(environment, rayDirection);
+        // The sun is a disc at infinity and a ray can walk into it too, so this
+        // gets the same MIS weight the estimator uses. The dome has no second
+        // strategy and needs none.
+        if (insideDistantLight(distantLight, rayDirection))
+        {
+            float weight = 1.0f;
+#if DIRECT_LIGHT_SAMPLING
+            // With the estimator off the path sampler is the only strategy and
+            // keeps everything, or the "path sampling only" build would be dark.
+            const float sunChance = distantLightSelectionChance(distantLight, lightCount,
+                totalLightArea);
+            const float lightDensity = lightStrategyPdf(distantLight, sunChance, 0.0f, rayDirection);
+            const float bsdfDensity = pathSegment.lastPdf;
+            weight = (bsdfDensity > 0.0f) ? misWeight(bsdfDensity, lightDensity) : 1.0f;
+#endif
+            radiance += distantLight.radiance * weight;
+        }
+        if (radiance.x > 0.0f || radiance.y > 0.0f || radiance.z > 0.0f)
+        {
+            const glm::vec3 contribution = pathSegment.color * radiance;
+            atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
+            atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
+            atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+        }
         pathSegment.color = glm::vec3(0.0f);
         pathSegment.remainingBounces = -1;
         return;
@@ -1458,26 +1683,34 @@ __global__ void shadeMaterials(
     if (material.emittance > 0.0f)
     {
         glm::vec3 contribution = pathSegment.color * material.color * material.emittance;
-        // Direct light sampling has already delivered the light for this path
-        // segment if the previous vertex was diffuse, so adding it here as well
-        // would count it twice. Delta vertices cannot be sampled towards a light
-        // and keep this path, which is what makes the split unbiased.
-        if (pathSegment.countsEmission)
+        // Two strategies found this light, so MIS weights the path's estimate by
+        // how well it does here; a delta sample (lastPdf == 0) keeps full weight.
+        float weight = 1.0f;
+#if DIRECT_LIGHT_SAMPLING
+        if (pathSegment.lastPdf > 0.0f)
         {
-            atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
-            atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
-            atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+            const glm::vec3 rayDirection = glm::normalize(pathSegment.ray.direction);
+            const glm::vec3 hitPoint = pathSegment.ray.origin + intersection.t * rayDirection;
+            // The light strategy's density for this direction, at this hit point.
+            const float areaDensity = lightSamplePdfForGeom(lights, lightCount,
+                pathSegment.ray.origin, hitPoint, intersection.surfaceNormal, intersection.geomId);
+            const float sunChance = distantLightSelectionChance(distantLight, lightCount,
+                totalLightArea);
+            const float lightDensity = lightStrategyPdf(distantLight, sunChance, areaDensity,
+                rayDirection);
+            if (lightDensity > 0.0f)
+            {
+                weight = misWeight(pathSegment.lastPdf, lightDensity);
+            }
         }
+#endif
+        contribution *= weight;
+        atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
+        atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
+        atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
 #if DIRECT_LIGHT_SAMPLING && DIRECT_LIGHT_STATS
-        else
         {
-            // A random walk walked into an emitter at a diffuse vertex, which is
-            // precisely the radiance the estimator delivered for that vertex
-            // instead. It is dropped here (that is what keeps the split without
-            // MIS unbiased), but it is exactly the number the estimator has to
-            // match, so it is counted for the ledger - separately for the hits
-            // that come from inside the light's volume, which are the only ones
-            // the estimator has to treat differently.
+            // Ledger: what this hit weighed, against a renderer without MIS.
             int hitLight = -1;
             for (int i = 0; i < lightCount; i++)
             {
@@ -1486,13 +1719,14 @@ __global__ void shadeMaterials(
                     hitLight = i;
                 }
             }
-            const double foldedEnergy =
-                (double)(contribution.x + contribution.y + contribution.z);
-            ledgerRecordFolded(*foldedLedger, foldedEnergy);
+            const double plainEnergy = (double)(pathSegment.color.x * material.color.x
+                + pathSegment.color.y * material.color.y
+                + pathSegment.color.z * material.color.z) * (double)material.emittance;
+            ledgerRecordBsdfHit(*foldedLedger, plainEnergy, (double)weight);
             if (hitLight >= 0
                 && pathSegment.ray.origin.y > lights[hitLight].boundsMin.y)
             {
-                ledgerRecordFolded(*foldedAboveLedger, foldedEnergy);
+                ledgerRecordBsdfHit(*foldedAboveLedger, plainEnergy, (double)weight);
             }
             if (hitLight >= 0)
             {
@@ -1502,9 +1736,9 @@ __global__ void shadeMaterials(
                 else if (fabsf(n.z) > 0.5f) { hitFace = (n.z > 0.0f) ? 1 : 0; }
                 else { hitFace = (n.y > 0.0f) ? 3 : 2; }
                 const bool fromAbove = pathSegment.ray.origin.y > lights[hitLight].boundsMin.y;
-                ledgerRecordFolded(
+                ledgerRecordBsdfHit(
                     foldedFaceLedger[hitFace + LIGHT_SAMPLE_FACES * (fromAbove ? 1 : 0)],
-                    foldedEnergy);
+                    plainEnergy, (double)weight);
             }
         }
 #endif
@@ -1556,29 +1790,72 @@ __global__ void shadeMaterials(
     }
 
     // --- Direct lighting (next event estimation) -------------------------
-    // A diffuse vertex connects straight to a random point on a light instead of
-    // waiting for a path to stumble into one. The estimator is the usual one:
-    // sample the light by area, convert the density to solid angle (the measure
-    // the BSDF and the cosine live in), evaluate the Lambertian BRDF and reject
-    // the sample if anything blocks the segment.
-    const bool diffuseVertex = (material.hasReflective <= 0.0f && material.hasRefractive <= 0.0f);
+    // A diffuse vertex connects straight to a random point on a light: sample the
+    // light, convert the density to solid angle, evaluate the BSDF there and
+    // reject the sample if the segment is blocked. MIS folds in the path's own
+    // emitter hits, which needs a lobe with a density to aim at the light - a
+    // mirror or a dielectric can only find one by accident.
+    const bool connectableVertex = bsdfHasNonDeltaLobe(material);
 #if DIRECT_LIGHT_SAMPLING
-    if (diffuseVertex && lightCount > 0 && totalLightArea > 0.0f)
+    const bool areaLightsEnabled = (lightCount > 0 && totalLightArea > 0.0f);
+    const float sunChance = distantLightSelectionChance(distantLight, lightCount, totalLightArea);
+    if (connectableVertex && (areaLightsEnabled || distantLight.enabled != 0))
     {
-        // Four draws, always, so that the dimension budget of a sample does not
-        // depend on where on which light it landed.
+        // Seven draws, always, so the dimension budget is sample independent.
+        const float lightChoice = lightU01(rng);
         const float lu0 = lightU01(rng);
         const float lu1 = lightU01(rng);
         const float lu2 = lightU01(rng);
         const float lu3 = lightU01(rng);
+        const float su0 = lightU01(rng);
+        const float su1 = lightU01(rng);
+        const glm::vec3 wo = -glm::normalize(pathSegment.ray.direction);
+
+        if (lightChoice < sunChance)
+        {
+            // --- The distant light: aim at the disc ------------------------
+            // Every sample lands on the disc, and an unblocked shadow ray also
+            // says the direction missed any area light - which is what lets the
+            // two parts of the strategy share one density.
+            const glm::vec3 wi = sampleDistantLight(distantLight, su0, su1);
+            const float cosSurface = glm::dot(normal, wi);
+            const float lightPdf = sunChance * distantLightPdf(distantLight, wi);
+            LightSampleOutcome outcome = LIGHT_REJECT_COS_SURFACE;
+            double sampleEnergy = 0.0;
+            if (cosSurface > 0.0f && lightPdf > 0.0f)
+            {
+                outcome = LIGHT_REJECT_OCCLUDED;
+                const glm::vec3 shadowOrigin = intersect + normal * 1e-3f;
+                if (!isOccluded(geoms, geomCount, shadowOrigin, wi, 1e30f, -1))
+                {
+                    float bsdfDensity = 0.0f;
+                    const glm::vec3 f = bsdfEval(material, normal, wo, wi, bsdfDensity);
+                    const float weight = misWeight(lightPdf, bsdfDensity);
+                    const glm::vec3 contribution = pathSegment.color * f
+                        * (cosSurface * weight / lightPdf) * distantLight.radiance;
+                    sampleEnergy = (double)(contribution.x + contribution.y + contribution.z);
+                    atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
+                    atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
+                    atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+                    outcome = LIGHT_ACCEPTED;
+                }
+            }
+#if DIRECT_LIGHT_STATS
+            // The disc gets the extra ledger row (see pathtraceInit).
+            ledgerRecord(lightLedger[lightCount], outcome, sampleEnergy);
+#else
+            (void)sampleEnergy;
+#endif
+        }
+        else
+        {
+        // --- The area lights: sample a point on the surface of one ---------
         glm::vec3 lightPoint, lightNormal, lightEmission;
-        float lightAreaPdf = 0.0f;
         int lightGeom = -1;
         int lightIndex = -1;
         int lightFace = -1;
-        if (sampleLightSurface(lights, lightCount, lu0, lu1, lu2, lu3,
-                lightPoint, lightNormal, lightEmission, lightAreaPdf, lightGeom,
-                lightIndex, lightFace))
+        if (sampleLightSurface(lights, lightCount, intersect, lu0, lu1, lu2, lu3,
+                lightPoint, lightNormal, lightEmission, lightGeom, lightIndex, lightFace))
         {
             glm::vec3 toLight = lightPoint - intersect;
             const float distance2 = glm::dot(toLight, toLight);
@@ -1586,14 +1863,10 @@ __global__ void shadeMaterials(
             const glm::vec3 wi = toLight / distance;
             const float cosSurface = glm::dot(normal, wi);
             const float cosLight = glm::dot(lightNormal, -wi);
-            // cosLight > 0 means the shading point is on the side the sampled
-            // face points at, i.e. this is the part of the light the base
-            // renderer can actually see: a ray towards a face pointing away from
-            // the shading point would enter the box through a nearer face first
-            // and stop there. Half of all samples land on such a face (the
-            // ledger counts them under "behind the sampled face") and dropping
-            // them is what makes the estimator match the renderer rather than
-            // light the room twice.
+            // cosLight > 0 means the renderer can see this part of the light: a ray
+            // towards an away-facing face would enter the box through a nearer one
+            // first. Half of all samples land there; dropping them is what makes
+            // the estimator match the renderer instead of lighting twice.
             LightSampleOutcome outcome = LIGHT_REJECT_COS_SURFACE;
             double sampleEnergy = 0.0;
             if (cosSurface > 0.0f)
@@ -1602,16 +1875,25 @@ __global__ void shadeMaterials(
                 if (cosLight > 0.0f)
                 {
                     outcome = LIGHT_REJECT_OCCLUDED;
-                    const float lightPdf = lightAreaPdf * distance2
-                        / glm::max(cosLight, 1e-4f);
+                    // Density for the whole light strategy: the picked surface
+                    // light, plus the sun's density if its disc covers this
+                    // direction too.
+                    const float areaDensity = lightSampleSolidAnglePdf(lights[lightIndex],
+                        lightCount, intersect, lightPoint, lightNormal);
+                    const float lightPdf = lightStrategyPdf(distantLight, sunChance, areaDensity, wi);
                     const glm::vec3 shadowOrigin = intersect + normal * 1e-3f;
                     const int shadowSkip = LIGHT_SKIP_SELF_IN_SHADOW ? lightGeom : -1;
                     if (!isOccluded(geoms, geomCount, shadowOrigin, wi, distance - 1e-3f, shadowSkip))
                     {
-                        // Lambertian BRDF: albedo / pi (already textured by now).
-                        const glm::vec3 brdf = material.color / PI;
-                        const glm::vec3 contribution =
-                            pathSegment.color * brdf * (cosSurface / lightPdf) * lightEmission;
+                        // The light strategy chose the direction; the BSDF density
+                        // is what the path would have produced for it - the other
+                        // half of the MIS weight.
+                        const glm::vec3 wo = -glm::normalize(pathSegment.ray.direction);
+                        float bsdfDensity = 0.0f;
+                        const glm::vec3 f = bsdfEval(material, normal, wo, wi, bsdfDensity);
+                        const float weight = misWeight(lightPdf, bsdfDensity);
+                        const glm::vec3 contribution = pathSegment.color * f
+                            * (cosSurface * weight / lightPdf) * lightEmission;
                         sampleEnergy = (double)(contribution.x + contribution.y + contribution.z);
                         atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
                         atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
@@ -1628,10 +1910,11 @@ __global__ void shadeMaterials(
             (void)sampleEnergy;
 #endif
         }
+        }
     }
 #else
     (void)lightU01; (void)lightCount; (void)totalLightArea; (void)lights;
-    (void)diffuseVertex;
+    (void)connectableVertex;
     (void)lightLedger; (void)lightFaceLedger; (void)foldedLedger;
     (void)foldedAboveLedger;
     (void)foldedFaceLedger;
@@ -1690,20 +1973,8 @@ __global__ void shadeMaterials(
     (void)rrSurvivalMilli;
 #endif
 
-#if DIRECT_LIGHT_SAMPLING
-    // Tell the next vertex whether it still has to count the emitters it hits.
-    // A diffuse vertex was already connected to a light by the estimator above,
-    // so its BSDF rays must not add the same light again; a delta vertex cannot
-    // be sampled towards a light at all, so it keeps counting them.
-    pathSegment.countsEmission = diffuseVertex ? 0 : 1;
-#else
-    // Without the estimator nothing was connected to a light, so every emitter
-    // hit still has to be counted. Dropping this line (or hoisting it out of the
-    // #if) silently deletes the light from every path that leaves a diffuse
-    // surface, which measured 0.0168 instead of 0.1385 mean radiance on Cornell.
-    pathSegment.countsEmission = 1;
-#endif
-
+    // The scattered ray carried its own density into the next vertex (see
+    // PathSegment::lastPdf), so there is nothing left to hand over here.
     pathSegment.remainingBounces--;
 }
 
@@ -1917,6 +2188,8 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_lights,
             h_lightCount,
             h_totalLightArea,
+            hst_scene->state.environment,
+            hst_scene->state.distantLight,
             dev_lightLedger,
             dev_lightFaceLedger,
             dev_foldedLedger,

@@ -35,6 +35,67 @@ void Scene::loadFromJSON(const std::string& jsonName)
 {
     std::ifstream f(jsonName);
     json data = json::parse(f);
+
+    // Environment light (optional): rays that leave the scene see the sky
+    // gradient above the horizon and the ground colour below it. No block =
+    // black background.
+    state.environment.zenith = glm::vec3(0.0f);
+    state.environment.horizon = glm::vec3(0.0f);
+    state.environment.ground = glm::vec3(0.0f);
+    state.environment.intensity = 1.0f;
+    if (data.contains("Environment"))
+    {
+        const auto& env = data["Environment"];
+        auto readColor = [](const json& block, const char* key, glm::vec3 fallback)
+        {
+            if (!block.contains(key))
+            {
+                return fallback;
+            }
+            const auto& c = block[key];
+            return glm::vec3(c[0], c[1], c[2]);
+        };
+        state.environment.zenith = readColor(env, "ZENITH", glm::vec3(0.0f));
+        state.environment.horizon = readColor(env, "HORIZON", state.environment.zenith);
+        state.environment.ground = readColor(env, "GROUND", glm::vec3(0.0f));
+        state.environment.intensity = env.value("INTENSITY", 1.0f);
+        cout << "[env] dome: zenith (" << state.environment.zenith.x << " "
+            << state.environment.zenith.y << " " << state.environment.zenith.z
+            << "), horizon (" << state.environment.horizon.x << " "
+            << state.environment.horizon.y << " " << state.environment.horizon.z
+            << "), ground (" << state.environment.ground.x << " "
+            << state.environment.ground.y << " " << state.environment.ground.z
+            << "), intensity " << state.environment.intensity << endl;
+    }
+
+    // Distant light (optional): a sun of angular radius ANGULAR_RADIUS degrees
+    // travelling in DIRECTION. No block = no distant light.
+    state.distantLight.enabled = 0;
+    state.distantLight.direction = glm::vec3(0.0f, -1.0f, 0.0f);
+    state.distantLight.radiance = glm::vec3(0.0f);
+    state.distantLight.cosMaxAngle = 1.0f;
+    state.distantLight.solidAngle = 1.0f;
+    if (data.contains("DistantLight"))
+    {
+        const auto& sun = data["DistantLight"];
+        const auto& dir = sun["DIRECTION"];
+        const auto& col = sun["RGB"];
+        const float radiusDegrees = sun.value("ANGULAR_RADIUS", 0.5f);
+        const float intensity = sun.value("INTENSITY", 1.0f);
+        state.distantLight.direction = glm::normalize(glm::vec3(dir[0], dir[1], dir[2]));
+        state.distantLight.radiance = glm::vec3(col[0], col[1], col[2]) * intensity;
+        const float cosMax = cosf(glm::radians(glm::clamp(radiusDegrees, 0.01f, 89.0f)));
+        state.distantLight.cosMaxAngle = cosMax;
+        state.distantLight.solidAngle = TWO_PI * (1.0f - cosMax);
+        state.distantLight.enabled = 1;
+        cout << "[sun] travelling in (" << state.distantLight.direction.x << " "
+            << state.distantLight.direction.y << " " << state.distantLight.direction.z
+            << "), radiance (" << state.distantLight.radiance.x << " "
+            << state.distantLight.radiance.y << " " << state.distantLight.radiance.z
+            << "), angular radius " << radiusDegrees << " degrees, solid angle "
+            << state.distantLight.solidAngle << endl;
+    }
+
     const auto& materialsData = data["Materials"];
     std::unordered_map<std::string, uint32_t> MatNameToID;
     for (const auto& item : materialsData.items())

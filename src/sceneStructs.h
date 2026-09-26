@@ -59,6 +59,35 @@ struct Material
     float textureScale;
 };
 
+/**
+ * Environment light (infinite area light): the radiance a ray sees when it
+ * leaves the scene, as a smooth three colour sky. All zero by default, i.e. the
+ * black background the renderer shipped with.
+ */
+struct Environment
+{
+    glm::vec3 zenith;
+    glm::vec3 horizon;
+    glm::vec3 ground;
+    float intensity;
+};
+
+/**
+ * Distant light (a sun): a disc at infinity. `direction` is the direction the
+ * light travels in (PBRT's convention), so towards the light is its negation.
+ * The disc covers a few thousandths of a steradian - a path will almost never
+ * walk into it, while aiming at it costs one shadow ray, which is what the light
+ * strategy is for. `enabled` is 0 for scenes without one.
+ */
+struct DistantLight
+{
+    glm::vec3 direction;
+    glm::vec3 radiance;
+    float cosMaxAngle;   // cosine of the angular radius of the disc
+    float solidAngle;    // 2 pi (1 - cosMaxAngle), the density's denominator
+    int enabled;
+};
+
 struct Camera
 {
     glm::ivec2 resolution;
@@ -87,6 +116,9 @@ struct RenderState
     // progress (0 disables it). A checkpoint that existed when the render
     // started was already consumed by the resume in runCuda().
     float checkpointInterval;
+    // Optional Environment / DistantLight blocks; both inert when absent.
+    Environment environment;
+    DistantLight distantLight;
 };
 
 struct PathSegment
@@ -95,11 +127,11 @@ struct PathSegment
     glm::vec3 color;
     int pixelIndex;
     int remainingBounces;
-    // 1 when an emitter hit by this path segment must be added to the image.
-    // Direct light sampling delivers the light for a diffuse vertex, so the path
-    // hit that follows it must not be counted a second time; a delta BSDF cannot
-    // be sampled towards a light, so its emitters are still counted by the path.
-    int countsEmission;
+    // Solid angle density of the BSDF sample that produced this segment, or 0 if
+    // it came from a delta lobe (mirror, dielectric) whose density is a Dirac.
+    // That is the weight MIS needs when the segment lands on an emitter; with
+    // light sampling off nothing reads it.
+    float lastPdf;
 };
 
 // Use with a corresponding PathSegment to do:
