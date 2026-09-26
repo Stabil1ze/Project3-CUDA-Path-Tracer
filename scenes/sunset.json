@@ -1,0 +1,212 @@
+{
+    "_comment": "Open Cornell box lit by a low warm sun plus a blue sky dome: no emissive geometry at all, which is only possible because the renderer now has lights at infinity (DistantLight + Environment). The sun is aimed at by the estimator (one shadow ray), the sky is found by the paths that leave the box.",
+    "Environment": {
+        "ZENITH": [
+            0.12,
+            0.28,
+            0.75
+        ],
+        "HORIZON": [
+            0.55,
+            0.62,
+            0.85
+        ],
+        "GROUND": [
+            0.13,
+            0.12,
+            0.11
+        ],
+        "INTENSITY": 1.0
+    },
+    "DistantLight": {
+        "DIRECTION": [
+            0.62,
+            -0.55,
+            0.55
+        ],
+        "RGB": [
+            1.0,
+            0.72,
+            0.42
+        ],
+        "INTENSITY": 55.0,
+        "ANGULAR_RADIUS": 1.5
+    },
+    "Materials": {
+        "diffuse_white": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.98,
+                0.98,
+                0.98
+            ]
+        },
+        "diffuse_red": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.85,
+                0.35,
+                0.35
+            ]
+        },
+        "diffuse_green": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.35,
+                0.85,
+                0.35
+            ]
+        },
+        "specular_white": {
+            "TYPE": "Specular",
+            "RGB": [
+                0.98,
+                0.98,
+                0.98
+            ],
+            "ROUGHNESS": 0.0
+        }
+    },
+    "Camera": {
+        "RES": [
+            800,
+            800
+        ],
+        "FOVY": 45.0,
+        "ITERATIONS": 1000,
+        "DEPTH": 8,
+        "FILE": "sunset",
+        "EYE": [
+            0.0,
+            5.0,
+            10.5
+        ],
+        "LOOKAT": [
+            0.0,
+            6.5,
+            0.0
+        ],
+        "UP": [
+            0.0,
+            1.0,
+            0.0
+        ],
+        "CHECKPOINT": 0
+    },
+    "Objects": [
+        {
+            "TYPE": "cube",
+            "MATERIAL": "diffuse_white",
+            "TRANS": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                10.0,
+                0.01,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "diffuse_white",
+            "TRANS": [
+                0.0,
+                10.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                90.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "diffuse_white",
+            "TRANS": [
+                0.0,
+                5.0,
+                -5.0
+            ],
+            "ROTAT": [
+                0.0,
+                90.0,
+                0.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "diffuse_red",
+            "TRANS": [
+                -5.0,
+                5.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "diffuse_green",
+            "TRANS": [
+                5.0,
+                5.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "sphere",
+            "MATERIAL": "specular_white",
+            "TRANS": [
+                -1.0,
+                4.0,
+                -1.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                3.0,
+                3.0,
+                3.0
+            ]
+        }
+    ]
+}
