@@ -41,6 +41,11 @@ procedural shapes and textures.
 | 14 | Glossy specular: a GGX microfacet lobe with Smith masking-shadowing and importance sampling of the visible normal distribution | `src/ggx.h`, `src/interactions.cu` |
 | 15 | Low-discrepancy sampling: a scrambled Halton sequence for the pixel area and the lens, kept off the path dimensions after measuring both | `src/sampling.h`, `src/pathtrace.cu` |
 | 16 | Direct light sampling (next event estimation): every diffuse vertex is connected to a random point on the surface of a random light, with a shadow ray and a ledger that measures what the estimator delivers against what it replaced | `src/pathtrace.cu` |
+| 17 | Three part material system: `bsdfSample` / `bsdfEval` / `bsdfPdf` in `src/bsdf.h`, one lobe mixture shared by the path sampler and the light estimator | `src/bsdf.h` |
+| 18 | Multiple importance sampling (power heuristic) between the light strategy, the BSDF strategy and the delta lobes, which is what makes the estimator better than path sampling for *any* light size | `src/pathtrace.cu` |
+| 19 | Environment light (dome): a three colour sky seen by every escaping ray, i.e. an infinite area light that lights an open scene | `src/pathtrace.cu`, `src/scene.cpp` |
+| 20 | Distant light (sun): a disc at infinity, sampled by solid angle and combined with the paths that walk into it | `src/pathtrace.cu`, `src/scene.cpp` |
+| 21 | Spherical area lights sampled by solid angle over their tangent cone (a box is still sampled by area, which is exactly rectangle sampling) | `src/pathtrace.cu` |
 
 The two features that change the image (#3, #4) are behind `#define`s
 (`STOCHASTIC_AA`, `STREAM_COMPACTION`), so every number below can be reproduced by
@@ -1163,8 +1168,183 @@ Sampling only the faces the shading point can actually see - for an axis aligned
 box, the face on the shading point's side of each axis - and dividing by the
 visible area instead of the whole surface doubles the importance of every sample
 that is kept, and for a constant integrand cuts the estimator's variance in half.
-That, plus MIS against the BSDF samples the path still takes, is the version that
-would also beat path sampling in the course scene.
+The other half of the fix, multiple importance sampling, is the subject of the
+next section, and it is what turns the number above around: on the same course
+scene the estimator goes from 24.28% relative error (light sampling alone) to
+**12.83%**, against 22.35% for path sampling alone.
+
+### A material system in three parts, and multiple importance sampling
+
+Multiple importance sampling needs three things from a material, and the renderer
+only had one of them. It had the sampler - draw a direction, divide by the
+density you drew it with - which is all a path tracer needs. It needs two more as
+soon as somebody else chooses the direction: the *value* of the BSDF in that
+direction, and the *density* the sampler would have produced for it. So the BSDF
+moved out of `scatterRay` into `src/bsdf.h` as three functions:
+
+| function | what it answers |
+|---|---|
+| `bsdfSample` | draw a direction and weight it (what the path tracer calls) |
+| `bsdfEval` | the BSDF at a *given* pair of directions, plus `pdf` |
+| `bsdfPdf` | just the density, for when only the weight needs it |
+
+The material stays a probabilistic mixture of three lobes - diffuse, microfacet
+specular, dielectric - and the two views of it have to agree:
+
+$$
+f(\omega_i) = \sum_j p_j f_j(\omega_i), \qquad \mathrm{pdf}(\omega_i) = \sum_j p_j \mathrm{pdf}_j(\omega_i)
+$$
+
+The sampler picks one lobe and returns that lobe's own estimate, so the p_j
+cancels; `bsdfEval`/`bsdfPdf` report the mixture, because that is the density of
+the combined strategy and therefore the number a MIS weight has to divide by. A
+delta lobe (a mirror, a smooth dielectric) is the exception that shapes the whole
+interface: its density is a Dirac, so it reports `pdf = 0` and sets a `specular`
+flag, which tells the caller "no other strategy could have produced this
+direction, weight it 1". Its value at a single direction is zero, which is why it
+contributes nothing to the light strategy - and why caustics through glass stay a
+random walk problem.
+
+With that in place, the direct light term has three strategies instead of one:
+aim at an area light, aim at the sun, or let the path find either by chance. The
+weight is PBRT's power heuristic (and my CG2025 HW7's, so this is not new
+machinery to me, only new in CUDA):
+
+$$
+w_s = \frac{\mathrm{pdf}_s^2}{\mathrm{pdf}_L^2 + \mathrm{pdf}_B^2 + \mathrm{pdf}_{sun}^2}
+$$
+
+Everything hinges on the densities being *the same expression* on both sides, so
+the light side has exactly one definition of them,
+`lightSampleSolidAnglePdf`: for a box it is the area density converted to solid
+angle, for a sphere it is `1 / (N * solidAngle)` over the tangent cone, and for
+the sun it is `1 / (N * solidAngle)` over its disc. The two places that need it -
+the sample the estimator just took, and the emitter hit a path found on its own -
+call the same function. That is deliberate: a mismatch between those two call
+sites is precisely how a light sampling implementation ends up silently dark, and
+it is the failure this project already made once (see the -35.8% row below).
+
+The ledger from the previous section changed shape to match: instead of comparing
+"the estimator" against "the hits it replaced", it now checks the *whole* MIS
+combination against the unweighted hits, which is the estimator a renderer without
+light sampling would have. Both are estimates of the same integral at the same
+vertices, so they still have to agree, and now the check also covers the weights:
+if they did not sum to one per direction, this is where it would show.
+
+| scene | samples | MIS estimator | unweighted BSDF hits | difference |
+|---|---|---|---|---|
+| plane under a light | 200 | 916335 | 915663 (+-0.382%) | +0.07% +- 0.38% |
+| closed Cornell, 1 x 1 light | 200 | 6.82322e+6 | 6.82098e+6 (+-0.127%) | +0.03% +- 0.13% |
+| Cornell, light below the ceiling | 400 | 2.38038e+7 | 2.37844e+7 (+-0.071%) | +0.08% +- 0.07% |
+| open Cornell (the course scene) | 400 | 3.34049e+7 | 3.34001e+7 (+-0.059%) | **+0.01% +- 0.06%** |
+
+The course scene is the interesting row: the same check read -0.55% with the split
+estimator of the previous section and reads +0.01% here, and its error bar got
+*smaller* rather than larger, because the path's own emitter hits now carry part
+of the estimate instead of being discarded, which correlates the two sides.
+
+**What MIS is worth**, measured the same way as before (200 spp against a 6400
+spp reference, relative error over the unclipped pixels):
+
+| light | path sampling | light sampling alone | with MIS |
+|---|---|---|---|
+| 1 x 1 in a closed Cornell box | 55.67% | 24.57% | **24.57%** |
+| the course scene's 3 x 3 | 22.35% | 24.28% | **12.83%** |
+
+The small light is unchanged, and that is the correct answer rather than a
+missing feature: there the light's solid angle density is far above the BSDF's
+everywhere, so the MIS weight gives the light strategy essentially all of the
+weight. The large light is where MIS earns its keep, and it does it by
+suppressing exactly the samples that the previous section measured as harmful -
+the ones near the light, where the estimator's `1/d^2` blows up while the BSDF
+sampler is perfectly happy. Combining the two beats either one by a factor of
+1.74.
+
+### Lights at infinity, and spherical lights
+
+Three light types came out of the same interface, and they are the ones my CG2025
+HW7 had that this project's feature list did not mention.
+
+**Dome (environment light).** An optional `Environment` block gives the scene a
+sky: a zenith colour, a horizon colour and a ground colour, blended so that the
+horizon has no seam. Every ray that leaves the scene collects it, so an open scene
+is lit by its sky - the base renderer's background was black, i.e. it had no such
+light at all. This one is deliberately **not** sampled by a second strategy, and
+that is a measured decision rather than a shortcut: a smooth dome is the case the
+cosine weighted BSDF sampler is already optimal for. The check is exact rather
+than statistical - put a floor under a uniform sky of radiance L and the floor's
+radiance has to be $$\mathrm{albedo} \cdot L$$ because the irradiance from a
+uniform hemisphere is $$\pi L$$:
+
+```
+dome-analytic:   albedo 0.8, uniform sky L = 0.5, depth 1
+  every pixel 101/255 = 0.39608   (expected 0.4; the one level difference is the
+  8 bit floor of 0.4 * 255 = 101.999...)
+  distinct values in the image: 1 - the estimator has zero variance here
+```
+
+**Distant light (sun).** An optional `DistantLight` block adds a disc at infinity
+described by the direction it travels in, its radiance and its angular radius, and
+this one *is* sampled by two strategies: one shadow ray towards the disc, and the
+paths that happen to walk into it. A 1.5 degree disc covers 2.2e-3 steradians, so
+the chance that a cosine weighted ray lands in it is about 1 in 2500 while aiming
+at it costs one ray. Again the check is analytic, because the irradiance from a
+cone of half angle alpha at angle theta from the surface normal is $$L \pi
+\sin^2\alpha \cos\theta$$ exactly:
+
+```
+sun-analytic:    albedo 0.8, L = 400, angular radius 2 degrees, depth 1
+  sun overhead:  every pixel 99/255 = 0.38824   (expected 0.38987, i.e. 99.42/255)
+  sun at 45 deg: 70/255 = 0.27451               (expected 0.27568, i.e. 70.30/255)
+```
+
+Both land on the byte the closed form predicts, and the overhead case is uniform
+to a single value - which also says the MIS combination of the two strategies is
+*exactly* right: a double counted sun would read twice this, a dropped one zero.
+The path sampling build cannot reproduce that number at 200 spp, and for a
+different reason than noise: its pixels are either 0 or 320 (one lucky hit), so
+the ones that hit are clamped to 1.0 by the image format and the saved mean comes
+out 44% low. That is the same clamping that the bookkeeping note below describes,
+and it is worth seeing once: a small light does not only make path sampling
+noisy, it makes what it does produce unrepresentable.
+
+**Spherical area light.** A sphere with an emissive material was previously
+handled by the box light path, i.e. its samples were drawn on the surface of its
+*bounding box* - which is simply the wrong measure, and it is the kind of bug that
+looks plausible until you measure it. It now has its own sampler: uniform over the
+tangent cone the sphere covers as seen from the shading point, which lands on the
+visible cap by construction. Two consequences, both measured on the same 200 spp
+scene: **100% of the light samples are accepted** against 34.7% for the box (a box
+spends half its samples on faces pointing away), and the ledger's energy check
+reads -0.10% +- 0.09%. The closed form for a Lambertian sphere of radius R at
+distance d is the same as for a point light of the same total power,
+$$\mathrm{albedo} \cdot L (R/d)^2$$:
+
+```
+sphere-light-analytic:  albedo 0.8, L = 5, R = 1, d = 2.995, depth 1
+  with MIS:             0.44706 at the centre, 0.44474 over the image
+  path sampling only:   0.37647 at the centre, 0.44519 over the image
+  expected:             0.44590
+```
+
+The two builds agree with each other and with the closed form, and the single
+pixel that the path sampler got badly wrong (0.376) is the point of the feature.
+A rectangular light needs no new code: the box sampler draws uniformly by area
+over six faces, which for a thin box *is* uniform sampling of two rectangles, with
+the correct 1/(N A) density - it is the same estimator, not an approximation of it.
+
+![](img/lights.png)
+
+*The three new light types, all rendered by the default build: a sky dome over the
+open Cornell box, a 1.5 degree sun (visible in the sky at the top left, and the
+reason the mirror sphere is speckled - a mirror reflecting a disc that small is
+the caustic case MIS cannot fix), and a spherical lamp.*
+
+One bookkeeping note that is easy to get wrong when checking these numbers
+against an image: the ledger sums the contributions *before* the image is clamped
+to [0,1], so on a scene whose light is directly visible it reads higher than the
+saved PNG by exactly the clipped part of the emitter - 0.052 in the first case
+above, and the difference disappears in the analytic scenes, where nothing clips.
 
 The estimator has one more property worth having, from the refraction section:
 without it, a path that transmits through glass can only reach a light if the
