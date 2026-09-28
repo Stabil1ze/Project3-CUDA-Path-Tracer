@@ -69,6 +69,7 @@ set(sources
     src/main.cpp
     src/stb.cpp
     src/bvh.cpp
+    src/checkpoint.cu
     src/denoise.cpp
     src/image.cpp
     src/glslUtility.cpp
