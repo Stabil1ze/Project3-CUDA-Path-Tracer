@@ -13,6 +13,7 @@
 
 #include "sceneStructs.h"
 #include "scene.h"
+#include "bvh.h"
 #include "glm/glm.hpp"
 #include "glm/gtx/norm.hpp"
 #include "utilities.h"
@@ -24,65 +25,71 @@
 
 #define ERRORCHECK 1
 
-// Stochastic sampled antialiasing (Part 1 core feature): jitter the first ray
-// of every pixel inside its pixel area. Set to 0 to reproduce the aliased
-// "before" images for the write-up; 1 is the default.
+// Stochastic sampled antialiasing
+// 1 (default): jitter the camera ray inside its pixel
+// 0: sample the pixel centre - the aliased "before" image
 #define STOCHASTIC_AA 1
 
-// Stream compaction (Part 1 core feature): after every bounce, remove the
-// terminated paths from the working arrays so that later bounces only launch
-// threads for rays that are still alive. Set to 0 to measure the baseline that
-// keeps dead rays in the arrays and just skips them.
+// Stream compaction
+// 1 (default): remove the terminated paths after every bounce
+// 0: keep them and skip them inside the kernels
 #define STREAM_COMPACTION 1
 
-// Instrumentation for the procedural shapes: count the sphere tracing steps of
-// every SDF intersection test into a global counter plus a 16 bucket histogram,
-// which are copied back and printed at the end of the render. The atomics cost
-// a few percent, so set it to 0 when timing the scene.
+// Material sorting
+// 1: reorder the paths so that a warp sees one material
+// 0 (default): shade them in the order the bounces left them in
+#define SORT_BY_MATERIAL 0
+
+// Instrumentation for the material sort
+// 1 (default): print how mixed the warps are, before and after the sort
+// 0: off
+#define MATERIAL_SORT_STATS 1
+
+// Bounding volume hierarchy: walk a CPU built tree instead of testing every
+// primitive for every ray
+// 1 (default): use the BVH above BVH_MIN_PRIMITIVES
+// 0: flat loop
+#define USE_BVH 1
+
+// Below this many primitives the flat loop is faster than a traversal
+#define BVH_MIN_PRIMITIVES 24
+
+// Procedural shape instrumentation: sphere tracing steps into a global counter
+// plus a 16 bucket histogram, printed at the end of the render
+// 1 (default): on
+// 0: off (the atomics cost a few percent, so off when timing)
 #define SDF_STATS 1
 
-// Restartable rendering: save the accumulated image plus the sample count to
-// "<FILE>.ckpt" while a render is in progress, and pick it up again on the next
-// start. CHECKPOINT_PINNED_MEMORY selects the staging buffer used to pull the
-// accumulation buffer off the device - page-locked memory lets the driver DMA
-// straight into it, pageable memory makes it bounce through a staging buffer of
-// its own. Its "0" is the "before" side of the measurement in the README.
+// Restartable rendering
+// 1 (default): checkpoint the accumulation buffer every CHECKPOINT seconds
+// 0: disable
 #define RESTARTABLE 1
+// Staging buffer the checkpoint is pulled off the device into
+// 1 (default): pinned (page-locked) memory - the driver DMAs straight into it
+// 0: pageable memory, which bounces through a driver staging buffer
 #define CHECKPOINT_PINNED_MEMORY 1
 
-// Russian roulette: from RR_MIN_DEPTH segments on, kill each path with a
-// probability that grows as its throughput shrinks, and divide the survivors by
-// the survival probability (which is what keeps the estimator unbiased). Set to 0
-// to render every path until it escapes, hits an emitter or runs out of depth -
-// the "before" side of the measurement in the README.
+// Russian roulette: kill unimportant paths early without biasing the estimator
+// 1 (default): from RR_MIN_DEPTH segments on, survive with p = throughput and
+//              divide the survivors by p
+// 0: render every path until it escapes, hits an emitter or runs out of depth
 #define RUSSIAN_ROULETTE 1
 #define RR_MIN_DEPTH 3              // segments; segment 1 is the camera ray
 #define RR_MIN_SURVIVAL 0.05f       // never keep fewer than 5% of the paths
 
-// Direct lighting (next event estimation): connect every diffuse vertex to a
-// random point on an emissive object instead of waiting for a path to find one,
-// and MIS down the emitter hits BSDF sampling produces for those same vertices.
-// Set to 0 for the "before" side of the measurement.
-//
-// STATUS: on, and measured. The ledger below is what settled it - the energy the
-// estimator delivers matches the energy of the emitter hits it replaced on every
-// scene tried, all four checks within their error bars (README). It pays on a
-// small light (55.69% -> 31.84% relative error at 200 spp, +41% time) and is a
-// small loss on the course scene's 3 x 3 light, the case MIS exists for.
+// Direct lighting
+// 1 (default): on
+// 0: off - the "before" side of the measurement
 #define DIRECT_LIGHT_SAMPLING 1
 
-// Sample ledger for the estimator above: per light and per face, samples drawn,
-// accepted, why the rest were dropped, and the energy delivered against the BSDF
-// emitter hits it replaced - an unbiasedness test that needs no reference image.
-// A few atomics per light sample, hence the separate switch: off for timing.
+// Sample ledger for the estimator above
+// 1 (default): on (a few atomics per sample, so off when timing)
+// 0: off
 #define DIRECT_LIGHT_STATS 1
 
-// Is the sampled light skipped in its own shadow test? Yes: the kept samples sit
-// on faces the shading point can see (cosLight > 0), and for a convex light the
-// segment to such a sample touches nothing else. Leaving the light in costs 8.5
-// points of acceptance and 35.8% of the energy, because boxIntersectionTest
-// reports its t in the geometry's object space and comparing that against a world
-// space distance is not meaningful.
+// Skip the sampled light in its own shadow test
+// 1 (default): skip it
+// 0: keep it
 #define LIGHT_SKIP_SELF_IN_SHADOW 1
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
@@ -158,17 +165,95 @@ static int* dev_alive = NULL;          // predicate: 1 = keep, 0 = terminated
 static int* dev_scanIndices = NULL;    // exclusive prefix sum of the predicate
 static int h_scanCapacity = 0;         // elements allocated for dev_scanIndices
 
-// Per-bounce ray counts for the README analysis ("number of unterminated rays
-// after each bounce"). Ray termination does not depend on whether compaction is
-// enabled - the same rays die at the same bounce - so one profile describes
-// both configurations; only the amount of work differs.
+// Buffers for the material sort
+static int* dev_materialKeys = NULL;   // 0 = the ray escaped, otherwise 1 + material id
+static int* dev_bucketCounts = NULL;   // histogram of the keys
+static int* dev_bucketOffsets = NULL;  // exclusive prefix sum, i.e. run starts
+static int* dev_bucketCursors = NULL;  // the offsets again, bumped while scattering
+static int h_bucketCapacity = 0;       // elements allocated in each of the three above
+#if MATERIAL_SORT_STATS
+static std::vector<int> h_materialKeys;   // the keys, brought back for the analysis
+#endif
+
+// The BVH acceleration structure
+static BvhNode* dev_bvhNodes = NULL;
+static int* dev_bvhPrimitiveIds = NULL;
+static int h_bvhNodeCount = 0;
+static bool h_bvhActive = false;
+
+// Denoiser guides
+static glm::vec3* dev_firstNormal = NULL;
+static glm::vec3* dev_firstAlbedo = NULL;
+
+// Per-bounce ray counts for analysis
 static const int MAX_PROFILE_DEPTH = 64;
 static long long h_bounceAlive[MAX_PROFILE_DEPTH];
 static long long h_profileIters = 0;
 
-// Instrumentation for the procedural shapes (see SDF_STATS above): total sphere
-// tracing steps and a histogram of the steps a single test needed. Both live on
-// the device and are only touched by rays that test an SDF object.
+// GPU timer
+struct StageTimer
+{
+    cudaEvent_t events[2][2];
+    int slot = 0;
+    int recorded = 0;
+    int samples = 0;
+    double totalMs = 0.0;
+    bool created = false;
+
+    void init()
+    {
+        for (int s = 0; s < 2; s++)
+        {
+            cudaEventCreate(&events[s][0]);
+            cudaEventCreate(&events[s][1]);
+        }
+        slot = 0;
+        recorded = 0;
+        samples = 0;
+        totalMs = 0.0;
+        created = true;
+    }
+
+    void destroy()
+    {
+        if (!created) { return; }
+        for (int s = 0; s < 2; s++)
+        {
+            cudaEventDestroy(events[s][0]);
+            cudaEventDestroy(events[s][1]);
+        }
+        created = false;
+    }
+
+    void begin()
+    {
+        cudaEventRecord(events[slot][0]);
+    }
+
+    void end()
+    {
+        cudaEventRecord(events[slot][1]);
+        slot = 1 - slot;        // the other pair holds the previous iteration
+        recorded++;
+        if (recorded < 2) { return; }
+        if (cudaEventQuery(events[slot][1]) == cudaSuccess)
+        {
+            float ms = 0.0f;
+            cudaEventElapsedTime(&ms, events[slot][0], events[slot][1]);
+            totalMs += ms;
+            samples++;
+        }
+    }
+
+    double averageMs() const
+    {
+        return samples > 0 ? totalMs / samples : 0.0;
+    }
+};
+
+static StageTimer stageTrace, stageSort, stageShade;
+
+// SDF instrumentation
 static const int SDF_HISTOGRAM_BUCKETS = 16;
 static const int SDF_STEPS_PER_BUCKET = 8;
 static unsigned long long* dev_sdfSteps = NULL;
@@ -176,36 +261,24 @@ static unsigned long long* dev_sdfHistogram = NULL;
 static unsigned long long h_sdfSteps = 0;
 static unsigned long long h_sdfHistogram[SDF_HISTOGRAM_BUCKETS];
 
-// Russian roulette instrumentation: how many paths reached the RR depth and how
-// many of them were killed, plus the mean survival probability they were given.
-// Only meaningful with RUSSIAN_ROULETTE 1.
+// Russian roulette instrumentation
 static unsigned long long* dev_rrDecisions = NULL;
 static unsigned long long* dev_rrKills = NULL;
-// The survival probabilities are summed in fixed point (thousandths). Summing
-// them into a single float does not work: the running total passes 2^24 after a
-// few million decisions, and from there on every increment of ~0.7 is smaller
-// than one ulp of the accumulator and is silently dropped.
+
+// Summed in fixed point
 static unsigned long long* dev_rrSurvivalMilli = NULL;
 static unsigned long long h_rrDecisions = 0;
 static unsigned long long h_rrKills = 0;
 static unsigned long long h_rrSurvivalMilli = 0;
 
-// --- Direct lighting: the light list -------------------------------------
-// Every emissive geometry becomes one entry. The scenes only ever use emissive
-// boxes, they are axis aligned (the lights have no rotation) and a box is
-// uniform under area sampling, so a light is stored as its world space AABB plus
-// its emitted radiance. Sampling is uniform over the *surface* of the box, which
-// includes the thin sides - they are buried in the ceiling, but pretending they
-// are invisible would be a silent energy leak.
+// Direct lighting instrumentation
 struct DeviceLight
 {
     glm::vec3 boundsMin;
     glm::vec3 boundsMax;
     glm::vec3 emission;      // material colour * emittance
     float surfaceArea;
-    int geomIndex;           // which geometry this light is (to skip it in shadow rays)
-    // How the emitter is sampled: a box by area over its six faces, a sphere by
-    // solid angle over its tangent cone (constant density on the visible cap).
+    int geomIndex;           
     int shape;               // 0 = box, 1 = sphere
     float radius;            // sphere only
     glm::vec3 center;        // sphere only
@@ -222,10 +295,6 @@ static std::vector<DeviceLight> h_lightInfo;   // same list, kept for the printo
 static int h_lightCount = 0;
 static float h_totalLightArea = 0.0f;
 
-// --- Direct lighting: the sample ledger ----------------------------------
-// Per light and per face: samples drawn, accepted, why the rest were dropped,
-// and the energy the estimator delivered against the BSDF emitter hits it
-// replaced - an unbiasedness test that needs no converged reference render.
 enum LightSampleOutcome
 {
     LIGHT_ACCEPTED = 0,
@@ -241,14 +310,12 @@ struct LightLedger
     unsigned long long rejectCosSurface;
     unsigned long long rejectCosLight;
     unsigned long long occluded;
-    // Accepted samples of (r + g + b) after the MIS weight, i.e. what went into
-    // the image. The sum of squares gives the printout its error bar.
+
     double acceptedEnergy;
     double acceptedEnergySq;
-    // inf / NaN contributions: counted, not summed - one would poison the rest.
+
     unsigned long long nonFiniteEnergy;
-    // Emitter hits found by random walks: weighted energy, plain energy (the
-    // reference side of the check) and the plain sum of squares.
+
     unsigned long long bsdfHits;
     double bsdfEnergy;
     double bsdfEnergyPlain;
@@ -260,7 +327,7 @@ static const int LIGHT_SAMPLE_FACES = 6;
 static LightLedger* dev_lightLedger = NULL;       // one row per light
 static LightLedger* dev_lightFaceLedger = NULL;   // one row per light and face
 static LightLedger* dev_foldedLedger = NULL;      // the BSDF hits the estimator replaced
-static LightLedger* dev_foldedAboveLedger = NULL;  // ... the ones from above the light's bottom plane
+static LightLedger* dev_foldedAboveLedger = NULL;  
 static LightLedger* dev_foldedFaceLedger = NULL;   // [face + 6 * fromAbove], diagnostics
 
 static void addLedger(LightLedger& into, const LightLedger& from)
@@ -307,11 +374,21 @@ static void printBounceProfile(const char* tag, const long long* counts, int seg
     printf("\n");
 }
 
-// README instrumentation for the procedural shapes: how many sphere tracing
-// steps the SDF tests needed on average, and how they are distributed. The
-// spread is the interesting part on a GPU - every thread in a warp marches until
-// its own ray leaves the bounding sphere, so the warps pay the maximum of 32
-// different step counts.
+// Where the time went, as GPU milliseconds per bounce (see StageTimer)
+static void printStageTimings()
+{
+    const double trace = stageTrace.averageMs();
+    const double sort = stageSort.averageMs();
+    const double shade = stageShade.averageMs();
+    if (trace <= 0.0 && sort <= 0.0 && shade <= 0.0)
+    {
+        return;
+    }
+    printf("[stage] per bounce: intersections %.2f ms, material sort %.2f ms, shading %.2f ms "
+        "(%d bounces averaged)\n", trace, sort, shade, stageShade.samples);
+}
+
+// README instrumentation for the procedural shapes
 static void printSdfStats(int pixelcount)
 {
 #if SDF_STATS
@@ -350,9 +427,7 @@ static void printSdfStats(int pixelcount)
 #endif
 }
 
-// README instrumentation for Russian roulette: how often it fired and what it
-// saved. The bounce profile above shows the same thing from the other side (the
-// surviving path counts drop once RR is on).
+// README instrumentation for Russian roulette
 static void printRussianRouletteStats(int pixelcount)
 {
 #if RUSSIAN_ROULETTE
@@ -379,10 +454,7 @@ static void printRussianRouletteStats(int pixelcount)
 #endif
 }
 
-// README instrumentation for direct lighting: the sample ledger. It answers the
-// two questions the estimator has to answer about itself - which samples am I
-// losing, and is what I deliver equal to what I replaced - without needing a
-// converged reference render to compare against.
+// README instrumentation for direct lighting
 static const char* lightFaceName(int face)
 {
     switch (face)
@@ -470,11 +542,8 @@ static void printDirectLightStats(int pixelcount)
         }
     }
 
-    // The estimator against the one it replaced: under MIS the direct light term
-    // is the light strategy's energy plus the weighted share of the emitter hits
-    // the paths found themselves, where a renderer without light sampling adds
-    // those hits unweighted. Same integral, same vertices, so the totals agree in
-    // expectation.
+    // The estimator against the one it replaced: same integral over the same
+    // vertices, so the two totals agree in expectation
     if (folded.bsdfHits == 0 || total.accepted == 0)
     {
         printf("[lights] energy check: no samples to compare\n");
@@ -549,12 +618,8 @@ __device__ inline void ledgerRecord(LightLedger& row, LightSampleOutcome outcome
     }
 }
 
-/**
- * Record an emitter hit reached by a random walk, with the weight multiple
- * importance sampling gave it (`weight` is 1 for a delta sample and for the
- * renderer without light sampling, which is what makes the plain sum below the
- * reference side of the unbiasedness check).
- */
+/** Record an emitter hit reached by a random walk, with its MIS weight. A
+ *  `weight` of 1 (delta sample, or light sampling off) is the reference side. */
 __device__ inline void ledgerRecordBsdfHit(LightLedger& row, double energy,
     double weight)
 {
@@ -565,8 +630,7 @@ __device__ inline void ledgerRecordBsdfHit(LightLedger& row, double energy,
 }
 #endif
 
-/** A direction uniform in solid angle over the cone of half angle `cosMax`
- *  around `axis`. Used by the distant light and by spherical lights. */
+/** A direction uniform in solid angle over the cone of half angle `cosMax`. */
 __host__ __device__ inline glm::vec3 sampleCone(glm::vec3 axis, float cosMax, float u1, float u2)
 {
     const float cosTheta = glm::mix(cosMax, 1.0f, u1);
@@ -578,12 +642,9 @@ __host__ __device__ inline glm::vec3 sampleCone(glm::vec3 axis, float cosMax, fl
         + axis * cosTheta);
 }
 
-/**
- * Density of the light sampling strategy for a direction that reaches a point on
- * `light`, in solid angle, including the chance of having picked that light. One
- * definition, used by both the estimator and the MIS weights: two call sites
- * drifting apart is how a light sampling implementation ends up silently dark.
- */
+/** Solid angle density of the light strategy for a direction that reaches
+ *  `light`, including the chance of having picked it. One definition shared by
+ *  the estimator and the MIS weights, which must not drift apart. */
 __host__ __device__ inline float lightSampleSolidAnglePdf(const DeviceLight& light, int lightCount,
     glm::vec3 shadingPoint, glm::vec3 lightPoint, glm::vec3 lightNormal)
 {
@@ -727,38 +788,184 @@ __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, in
     return true;
 }
 
-/** Any geometry between the shading point and the light sample? */
-__host__ __device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3 origin,
-    glm::vec3 direction, float maxT, int skipGeom)
+// --- Bounding volume hierarchy traversal -----------------------------------
+// The tree is built on the host (see bvh.cpp) and walked iteratively: recursion
+// on the device diverges and the stack is small, so the traversal carries its
+// own array of node indices, bounded by BVH_MAX_DEPTH.
+#define BVH_STACK_SIZE (BVH_MAX_DEPTH + 4)
+
+/** Slab test: does the ray reach this box no further away than `maxT`?
+ *  `fminf`/`fmaxf` return the non-NaN operand, so a zero direction component
+ *  (0 * inf) falls out of the arithmetic instead of needing a branch. */
+__device__ inline bool rayHitsBox(const glm::vec3& boundsMin, const glm::vec3& boundsMax,
+    const glm::vec3& origin, const glm::vec3& inverseDirection, float maxT, float& entryDistance)
+{
+    const glm::vec3 t0 = (boundsMin - origin) * inverseDirection;
+    const glm::vec3 t1 = (boundsMax - origin) * inverseDirection;
+    // (`near` and `far` are macros in the Windows headers, hence the names.)
+    const glm::vec3 nearT = glm::vec3(fminf(t0.x, t1.x), fminf(t0.y, t1.y), fminf(t0.z, t1.z));
+    const glm::vec3 farT = glm::vec3(fmaxf(t0.x, t1.x), fmaxf(t0.y, t1.y), fmaxf(t0.z, t1.z));
+
+    const float entry = fmaxf(fmaxf(nearT.x, nearT.y), fmaxf(nearT.z, 0.0f));
+    const float exit = fminf(fminf(farT.x, farT.y), fminf(farT.z, maxT));
+    entryDistance = entry;
+    return exit >= entry;
+}
+
+/** Closest hit through the hierarchy; same contract as the flat loop. Children
+ *  are visited nearest first so `bestT` tightens early and the far subtrees are
+ *  cut by the slab test instead of being traversed. */
+__device__ inline bool bvhClosestHit(
+    const BvhNode* nodes,
+    const Geom* geoms,
+    const int* primitiveIds,
+    Ray ray,
+    unsigned long long* sdfSteps,
+    unsigned long long* sdfHistogram,
+    float& bestT,
+    glm::vec3& bestPoint,
+    glm::vec3& bestNormal,
+    int& bestGeom,
+    bool& bestOutside)
+{
+    const glm::vec3 inverseDirection(1.0f / ray.direction.x, 1.0f / ray.direction.y,
+        1.0f / ray.direction.z);
+    int stack[BVH_STACK_SIZE];
+    int top = 0;
+    stack[top++] = 0;
+    bestT = FLT_MAX;
+
+    while (top > 0)
+    {
+        const BvhNode node = nodes[stack[--top]];
+        float entry = 0.0f;
+        if (!rayHitsBox(node.boundsMin, node.boundsMax, ray.origin, inverseDirection, bestT, entry))
+        {
+            continue;
+        }
+
+        if (node.primitiveCount > 0)
+        {
+            for (int i = 0; i < node.primitiveCount; i++)
+            {
+                const int id = primitiveIds[node.firstPrimitive + i];
+                glm::vec3 point, normal;
+                bool outside = true;
+                const float t = intersectGeom(geoms[id], ray, point, normal, outside,
+                    sdfSteps, sdfHistogram);
+                if (t > 0.0f && t < bestT)
+                {
+                    bestT = t;
+                    bestPoint = point;
+                    bestNormal = normal;
+                    bestGeom = id;
+                    bestOutside = outside;
+                }
+            }
+            continue;
+        }
+
+        float leftEntry = 0.0f;
+        float rightEntry = 0.0f;
+        const BvhNode& left = nodes[node.leftChild];
+        const BvhNode& right = nodes[node.rightChild];
+        const bool hitLeft = rayHitsBox(left.boundsMin, left.boundsMax, ray.origin,
+            inverseDirection, bestT, leftEntry);
+        const bool hitRight = rayHitsBox(right.boundsMin, right.boundsMax, ray.origin,
+            inverseDirection, bestT, rightEntry);
+        if (hitLeft && hitRight)
+        {
+            // Push the farther one first: it is popped last, after the near
+            // subtree has had a chance to shrink the bound.
+            const bool nearFirst = leftEntry <= rightEntry;
+            stack[top++] = nearFirst ? node.rightChild : node.leftChild;
+            stack[top++] = nearFirst ? node.leftChild : node.rightChild;
+        }
+        else if (hitLeft)
+        {
+            stack[top++] = node.leftChild;
+        }
+        else if (hitRight)
+        {
+            stack[top++] = node.rightChild;
+        }
+    }
+
+    return bestT < FLT_MAX;
+}
+
+/** Any hit along the shadow ray, with the same early out the flat loop has. */
+__device__ inline bool bvhOccluded(const BvhNode* nodes, const Geom* geoms,
+    const int* primitiveIds, Ray shadow, float maxT, int skipGeom)
+{
+    const glm::vec3 inverseDirection(1.0f / shadow.direction.x, 1.0f / shadow.direction.y,
+        1.0f / shadow.direction.z);
+    int stack[BVH_STACK_SIZE];
+    int top = 0;
+    stack[top++] = 0;
+
+    while (top > 0)
+    {
+        const BvhNode node = nodes[stack[--top]];
+        float entry = 0.0f;
+        if (!rayHitsBox(node.boundsMin, node.boundsMax, shadow.origin, inverseDirection, maxT, entry))
+        {
+            continue;
+        }
+
+        if (node.primitiveCount > 0)
+        {
+            for (int i = 0; i < node.primitiveCount; i++)
+            {
+                const int id = primitiveIds[node.firstPrimitive + i];
+                if (id == skipGeom)
+                {
+                    continue;
+                }
+                glm::vec3 point, normal;
+                bool outside = true;
+                const float t = intersectGeom(geoms[id], shadow, point, normal, outside);
+                if (t > 1e-4f && t < maxT)
+                {
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        stack[top++] = node.leftChild;
+        stack[top++] = node.rightChild;
+    }
+
+    return false;
+}
+
+/** Is the segment from `origin` along `direction` (up to `maxT`) blocked?
+ *  `bvhNodes` NULL falls back to the flat loop, which is also the reference the
+ *  BVH has to match - both paths share `intersectGeom` and the same epsilon. */
+__device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3 origin,
+    glm::vec3 direction, float maxT, int skipGeom,
+    const BvhNode* bvhNodes = NULL, const int* bvhPrimitiveIds = NULL)
 {
     Ray shadow;
     shadow.origin = origin;
     shadow.direction = direction;
+    if (bvhNodes != NULL)
+    {
+        return bvhOccluded(bvhNodes, geoms, bvhPrimitiveIds, shadow, maxT, skipGeom);
+    }
     for (int i = 0; i < geomCount; i++)
     {
         if (i == skipGeom)
         {
-            // Never let a light shadow itself: a point on the sampled surface is
-            // behind its own silhouette for oblique views, which would reject
-            // valid samples.
+            // Never let a light shadow itself: a sampled point is behind its own
+            // silhouette for oblique views, which would reject valid samples
             continue;
         }
         Geom& geom = geoms[i];
         glm::vec3 p, n;
         bool outside = true;
-        float t = -1.0f;
-        if (geom.type == CUBE)
-        {
-            t = boxIntersectionTest(geom, shadow, p, n, outside);
-        }
-        else if (geom.type == SPHERE)
-        {
-            t = sphereIntersectionTest(geom, shadow, p, n, outside);
-        }
-        else
-        {
-            t = sdfIntersectionTest(geom, shadow, p, n, outside, NULL, NULL);
-        }
+        const float t = intersectGeom(geom, shadow, p, n, outside);
         if (t > 1e-4f && t < maxT)
         {
             return true;
@@ -769,10 +976,9 @@ __host__ __device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3
 
 // --- Multiple importance sampling -----------------------------------------
 
-/** Radiance of the environment light (the dome) in a direction: a three colour
- *  sky, horizon-to-zenith above and ground below, blended at the horizon.
- *  The escaping rays are what collect it, so a bright dome lights an open scene;
- *  it deliberately has no second sampling strategy (see the README). */
+/** Radiance of the environment light (the dome): a three colour sky, blended at
+ *  the horizon. Escaping rays collect it, so it needs no second sampling
+ *  strategy (see the README). */
 __host__ __device__ inline glm::vec3 environmentRadiance(const Environment& environment,
     glm::vec3 direction)
 {
@@ -828,19 +1034,16 @@ __host__ __device__ inline float distantLightSelectionChance(const DistantLight&
 }
 
 /** Density of the light strategy family (area lights + the sun) for a direction.
- *  `areaDensity` is what the area light part would produce, known by the caller
- *  from the sample it took or the hit it is looking at - and 0 when the direction
- *  leaves the scene, where it cannot have hit an area light. */
+ *  `areaDensity` is the caller's area light density, 0 for a direction that
+ *  leaves the scene. */
 __host__ __device__ inline float lightStrategyPdf(const DistantLight& sun, float sunChance,
     float areaDensity, glm::vec3 direction)
 {
     return (1.0f - sunChance) * areaDensity + sunChance * distantLightPdf(sun, direction);
 }
 
-/** Power heuristic (beta = 2) MIS weight:
- *      w = pdfThis^2 / (pdfThis^2 + pdfOther^2)
- *  Squaring makes the better strategy win faster than the balance heuristic
- *  would (PBRT and my CG2025 HW7 both use this form). */
+/** Power heuristic (beta = 2) MIS weight: w = a^2 / (a^2 + b^2). Squaring makes
+ *  the better strategy win faster than the balance heuristic. */
 __host__ __device__ inline float misWeight(float pdfThis, float pdfOther)
 {
     const float a = pdfThis * pdfThis;
@@ -852,9 +1055,6 @@ __host__ __device__ inline float misWeight(float pdfThis, float pdfOther)
 // ---------------------------------------------------------------------------
 // Restartable rendering - checkpoint file format and helpers
 // ---------------------------------------------------------------------------
-// Layout: a fixed header followed by the raw accumulation buffer (one glm::vec3
-// of un-normalised radiance per pixel, in the same pixel order as the kernel
-// writes it). Fixed size, no alignment surprises, no serialisation library.
 
 static const char CHECKPOINT_MAGIC[8] = { 'P', '3', 'C', 'K', 'P', 'T', '0', '1' };
 
@@ -897,13 +1097,7 @@ static unsigned long long hashCheckpointBytes(unsigned long long hash, const voi
     return hash;
 }
 
-/**
- * Fingerprint of everything a sample depends on: the camera (position, frame,
- * field of view, aperture, focus), the resolution, the depth, and the geometry
- * and materials. Two runs only share a checkpoint if all of it matches, so
- * editing the scene file - or just resizing it - starts from scratch instead of
- * adding samples of a different image into the accumulation buffer.
- */
+// Set fingerprint of the scene's state and geometry into a 64-bit hash
 static unsigned long long checkpointSceneHash(const Scene* scene)
 {
     unsigned long long hash = 1469598103934665603ull;
@@ -1020,10 +1214,7 @@ static bool ensureCheckpointStaging(size_t bytes)
     return true;
 }
 
-// Pull the accumulation buffer off the device into the staging buffer. Pinned
-// memory + an async copy on a dedicated stream is the fast path; the pageable
-// path is a plain blocking cudaMemcpy, which is what the measurement in the
-// README compares against.
+// Pull the accumulation buffer off the device into the staging buffer
 static double downloadCheckpointImage(size_t bytes)
 {
     auto start = std::chrono::steady_clock::now();
@@ -1065,12 +1256,61 @@ void pathtraceInit(Scene* scene)
     cudaMalloc(&dev_intersections, pixelcount * sizeof(ShadeableIntersection));
     cudaMemset(dev_intersections, 0, pixelcount * sizeof(ShadeableIntersection));
 
+    // Denoiser guides
+    cudaMalloc(&dev_firstNormal, pixelcount * sizeof(glm::vec3));
+    cudaMemset(dev_firstNormal, 0, pixelcount * sizeof(glm::vec3));
+    cudaMalloc(&dev_firstAlbedo, pixelcount * sizeof(glm::vec3));
+    thrust::fill(thrust::device, dev_firstAlbedo, dev_firstAlbedo + pixelcount,
+        glm::vec3(1.0f));
+
+    // BVH based acceleration structure
+    h_bvhActive = false;
+    h_bvhNodeCount = 0;
+    if (USE_BVH && (int)scene->geoms.size() >= BVH_MIN_PRIMITIVES)
+    {
+        Bvh bvh;
+        buildBvh(scene->geoms, bvh);
+        h_bvhNodeCount = (int)bvh.nodes.size();
+        cudaMalloc(&dev_bvhNodes, bvh.nodes.size() * sizeof(BvhNode));
+        cudaMemcpy(dev_bvhNodes, bvh.nodes.data(), bvh.nodes.size() * sizeof(BvhNode),
+            cudaMemcpyHostToDevice);
+        cudaMalloc(&dev_bvhPrimitiveIds, bvh.primitiveIds.size() * sizeof(int));
+        cudaMemcpy(dev_bvhPrimitiveIds, bvh.primitiveIds.data(),
+            bvh.primitiveIds.size() * sizeof(int), cudaMemcpyHostToDevice);
+        h_bvhActive = true;
+        printf("[bvh] %d primitives: %d nodes, %d leaves (%.1f primitives each), depth %d, "
+            "built in %.1f ms\n", (int)scene->geoms.size(), h_bvhNodeCount, bvh.leafCount,
+            bvh.leafCount > 0 ? (double)bvh.leafPrimitives / bvh.leafCount : 0.0, bvh.maxDepth,
+            bvh.buildMs);
+    }
+    else
+    {
+        printf("[bvh] %d primitives: flat loop%s\n", (int)scene->geoms.size(),
+            USE_BVH ? " (below the crossover)" : " (USE_BVH 0)");
+    }
+
     // Buffers for the stream compaction stage (see compactPaths below).
     h_scanCapacity = nextPowerOfTwoAtLeast(pixelcount + 1);   // +1 so the scan also yields the total
     cudaMalloc(&dev_pathsAlt, pixelcount * sizeof(PathSegment));
     cudaMalloc(&dev_intersectionsAlt, pixelcount * sizeof(ShadeableIntersection));
     cudaMalloc(&dev_alive, pixelcount * sizeof(int));
     cudaMalloc(&dev_scanIndices, h_scanCapacity * sizeof(int));
+
+    // Buffers for the material sort (see sortPathsByMaterial below): one key per
+    // path plus the three per-material arrays - one bucket per material, plus
+    // one for the rays that escaped.
+    h_bucketCapacity = nextPowerOfTwoAtLeast((int)scene->materials.size() + 2);
+    cudaMalloc(&dev_materialKeys, pixelcount * sizeof(int));
+    cudaMalloc(&dev_bucketCounts, h_bucketCapacity * sizeof(int));
+    cudaMalloc(&dev_bucketOffsets, h_bucketCapacity * sizeof(int));
+    cudaMalloc(&dev_bucketCursors, h_bucketCapacity * sizeof(int));
+#if MATERIAL_SORT_STATS
+    h_materialKeys.assign(pixelcount, 0);
+#endif
+
+    stageTrace.init();
+    stageSort.init();
+    stageShade.init();
 
     h_profileIters = 0;
     for (int i = 0; i < MAX_PROFILE_DEPTH; i++)
@@ -1193,6 +1433,27 @@ void pathtraceFree()
     cudaFree(dev_intersectionsAlt);
     cudaFree(dev_alive);
     cudaFree(dev_scanIndices);
+    cudaFree(dev_bvhNodes);
+    cudaFree(dev_bvhPrimitiveIds);
+    cudaFree(dev_firstNormal);
+    cudaFree(dev_firstAlbedo);
+    dev_firstNormal = NULL;
+    dev_firstAlbedo = NULL;
+    dev_bvhNodes = NULL;
+    dev_bvhPrimitiveIds = NULL;
+    h_bvhActive = false;
+    h_bvhNodeCount = 0;
+    cudaFree(dev_materialKeys);
+    cudaFree(dev_bucketCounts);
+    cudaFree(dev_bucketOffsets);
+    cudaFree(dev_bucketCursors);
+    dev_materialKeys = NULL;
+    dev_bucketCounts = NULL;
+    dev_bucketOffsets = NULL;
+    dev_bucketCursors = NULL;
+    stageTrace.destroy();
+    stageSort.destroy();
+    stageShade.destroy();
     cudaFree(dev_sdfSteps);
     cudaFree(dev_sdfHistogram);
     dev_sdfSteps = NULL;
@@ -1222,7 +1483,7 @@ void pathtraceFree()
 }
 
 // ---------------------------------------------------------------------------
-// Restartable rendering - public entry points (see pathtrace.h)
+// Restartable rendering - public entry points
 // ---------------------------------------------------------------------------
 
 void pathtraceFetchImage(Scene* scene)
@@ -1237,10 +1498,26 @@ void pathtraceFetchImage(Scene* scene)
     checkCUDAError("fetch image");
 }
 
+void pathtraceFetchDenoiseGuides(Scene* scene)
+{
+    if (dev_firstNormal == NULL || dev_firstAlbedo == NULL)
+    {
+        return;
+    }
+    const int pixelcount = scene->state.camera.resolution.x * scene->state.camera.resolution.y;
+    scene->state.normalImage.resize(pixelcount);
+    scene->state.albedoImage.resize(pixelcount);
+    cudaMemcpy(scene->state.normalImage.data(), dev_firstNormal,
+        pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(scene->state.albedoImage.data(), dev_firstAlbedo,
+        pixelcount * sizeof(glm::vec3), cudaMemcpyDeviceToHost);
+    checkCUDAError("fetch denoiser guides");
+}
+
 bool pathtraceSaveCheckpoint(Scene* scene, int iterationsDone)
 {
 #if RESTARTABLE
-    // CHECKPOINT 0 in the scene means "do not restart, I am watching this one".
+    // CHECKPOINT 0 in the scene means do no restart
     if (scene->state.checkpointInterval <= 0.0f || dev_image == NULL || iterationsDone <= 0)
     {
         return false;
@@ -1281,9 +1558,7 @@ bool pathtraceSaveCheckpoint(Scene* scene, int iterationsDone)
         && fwrite(h_checkpointStaging, 1, bytes, file) == bytes;
     fclose(file);
 
-    // Swap the finished file in only after it is complete on disk: a checkpoint
-    // that is interrupted by a crash or a kill must never replace a good one with
-    // a truncated one.
+    // Swap the finished file in only after it is complete on disk
     std::error_code ec;
     std::filesystem::remove(path, ec);
     ec.clear();
@@ -1311,17 +1586,11 @@ bool pathtraceSaveCheckpoint(Scene* scene, int iterationsDone)
 bool pathtraceLoadCheckpoint(Scene* scene, int* iterationsDone)
 {
 #if RESTARTABLE
-    if (dev_image == NULL)
-    {
-        return false;
-    }
+    if (dev_image == NULL) { return false; }
 
     const std::string path = checkpointPath(scene);
     FILE* file = fopen(path.c_str(), "rb");
-    if (file == NULL)
-    {
-        return false;
-    }
+    if (file == NULL) { return false; }
 
     CheckpointHeader header;
     if (fread(&header, sizeof(header), 1, file) != 1)
@@ -1420,13 +1689,8 @@ void printCheckpointStats()
 }
 
 /**
- * Generate PathSegments with rays from the camera through the screen into the
- * scene, which is the first bounce of rays.
- *
- * Antialiasing - the first ray of each pixel is jittered inside the pixel area
- *                (see STOCHASTIC_AA below).
- * motion blur  - jitter rays "in time"            (not implemented)
- * lens effect  - jitter ray origin positions based on a lens (not implemented)
+ * Generate the first bounce: one camera ray per pixel, jittered inside the pixel
+ * area (STOCHASTIC_AA) and, when the aperture is open, started on the lens disk.
  */
 __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, PathSegment* pathSegments)
 {
@@ -1439,17 +1703,14 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
-        // Grid coordinate of the sample. Note the convention of the camera
-        // transform below: at x = 0 the offset is exactly -resolution.x * 0.5
-        // times one pixel length, i.e. the left edge of the view. So integer
-        // (x, y) addresses the *corner* of a pixel and the pixel area is
-        // [x, x + 1) x [y, y + 1) - not [x - 0.5, x + 0.5).
+        // Integer (x, y) addresses the *corner* of a pixel: at x = 0 the offset
+        // below is exactly -resolution.x * 0.5 pixel lengths, the left edge of
+        // the view, so the pixel area is [x, x + 1) x [y, y + 1).
         float sampleX = (float)x;
         float sampleY = (float)y;
 
-        // Depth tag -1 gives the camera ray its own RNG stream: bounce `d`
-        // draws with tag `d`, so reusing tag 0 here would make the sub-pixel
-        // offset and the first scatter direction share random numbers.
+        // Depth tag -1 gives the camera ray its own RNG stream (bounce `d` draws
+        // with tag `d`); tag 0 would share numbers with the first scatter.
         constexpr int CAMERA_RNG_DEPTH = -1;
         thrust::default_random_engine rng =
             makeSeededRandomEngine(iter, index, CAMERA_RNG_DEPTH);
@@ -1457,13 +1718,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         // area, two for the lens. Everything after that belongs to the path.
         Sampler sampler((unsigned int)iter, (unsigned int)index, 0u);
 
-#if STOCHASTIC_AA
-        // A fresh jitter per iteration turns the per-pixel value into the
-        // average radiance over the pixel area (a box filter) instead of a
-        // point sample, which is what removes the stair-stepping on edges.
-        // The offset must span the whole pixel area, i.e. [0, 1) here; using
-        // [-0.5, 0.5) would sample half of the previous pixel and blur every
-        // edge across its neighbours.
+#if STOCHASTIC_AA // jitter the ray inside the pixel area
         sampleX += nextRandom(rng, sampler);
         sampleY += nextRandom(rng, sampler);
 #endif
@@ -1476,11 +1731,9 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         );
 
         // --- Physically based depth of field (thin lens model) -------------
-        // Instead of firing every ray from the pinhole, sample a point on the
-        // lens disk and aim the ray at the same point of the focal plane.
-        // Everything at `focalDistance` therefore stays sharp no matter where
-        // on the lens the ray started, and the blur circle of an out of focus
-        // point grows with `aperture * |1/z - 1/focalDistance|`.
+        // Start the ray on the lens disk but aim it at the focal plane, so
+        // everything at `focalDistance` stays sharp and an out of focus point at
+        // distance z blurs by `aperture * |1/z - 1/focalDistance|`.
         if (cam.aperture > 0.0f && cam.focalDistance > 0.0f)
         {
             float radius = cam.aperture * sqrtf(nextRandom(rng, sampler));   // sqrt = uniform over the disk
@@ -1507,10 +1760,6 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
     }
 }
 
-// TODO:
-// computeIntersections handles generating ray intersections ONLY.
-// Generating new rays is handled in your shader(s).
-// Feel free to modify the code below.
 __global__ void computeIntersections(
     int depth,
     int num_paths,
@@ -1519,7 +1768,9 @@ __global__ void computeIntersections(
     int geoms_size,
     ShadeableIntersection* intersections,
     unsigned long long* sdfStepCounter,
-    unsigned long long* sdfHistogram)
+    unsigned long long* sdfHistogram,
+    const BvhNode* bvhNodes,
+    const int* bvhPrimitiveIds)
 {
     int path_index = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -1533,6 +1784,32 @@ __global__ void computeIntersections(
         if (pathSegment.remainingBounces < 0)
         {
             intersections[path_index].t = -1.0f;
+            return;
+        }
+
+        // Accelerated path: the hierarchy holds the same primitives in the same
+        // `geoms` array, it just decides which of them are worth testing.
+        if (bvhNodes != NULL)
+        {
+            float t = 0.0f;
+            glm::vec3 point, normal;
+            int geomId = -1;
+            bool outside = true;
+            if (bvhClosestHit(bvhNodes, geoms, bvhPrimitiveIds, pathSegment.ray, sdfStepCounter,
+                    sdfHistogram, t, point, normal, geomId, outside))
+            {
+                intersections[path_index].t = t;
+                intersections[path_index].materialId = geoms[geomId].materialid;
+                intersections[path_index].surfaceNormal = normal;
+                intersections[path_index].geomId = geomId;
+                intersections[path_index].outside = outside ? 1 : 0;
+            }
+            else
+            {
+                intersections[path_index].t = -1.0f;
+                intersections[path_index].geomId = -1;
+                intersections[path_index].outside = 1;
+            }
             return;
         }
 
@@ -1552,22 +1829,12 @@ __global__ void computeIntersections(
         {
             Geom& geom = geoms[i];
 
-            if (geom.type == CUBE)
-            {
-                t = boxIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
-            }
-            else if (geom.type == SPHERE)
-            {
-                t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
-            }
-            else if (geom.type == MANDELBULB || geom.type == MENGER)
-            {
-                // Procedural signed distance field shapes: sphere traced, with
-                // an optional bounding sphere clip (see intersections.cu).
-                t = sdfIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside,
-                    sdfStepCounter, sdfHistogram);
-            }
-            // TODO: add more intersection tests here... triangle? metaball? CSG?
+            // One dispatch for every primitive kind (see intersectGeom): the
+            // procedural shapes are sphere traced with an optional bounding
+            // sphere clip, a mesh triangle is Moeller-Trumbore, the rest are
+            // closed forms.
+            t = intersectGeom(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside,
+                sdfStepCounter, sdfHistogram);
 
             // Compute the minimum t from the intersection tests to determine what
             // scene geometry object was hit first.
@@ -1598,24 +1865,11 @@ __global__ void computeIntersections(
     }
 }
 
-// Shade one bounce of every live path segment and generate the next ray by
-// evaluating the BSDF (scatterRay). This is the kernel that replaces the
-// original "fake" shader - it does a real BSDF evaluation and radiometric
-// accumulation instead of pseudo-lighting.
+// Shade one bounce of every live path segment: evaluate the BSDF (scatterRay),
+// which updates the throughput and writes the next ray.
 //
-// Path bookkeeping used here:
-//   pathSegment.color            running throughput of the path (starts white)
-//   pathSegment.remainingBounces > 0 : alive, may scatter
-//                                == 0 : alive but out of scattering budget, may
-//                                       still "see" an emitter
-//                                 < 0 : terminated, ignored by every later pass
-//                                       (this is the predicate stream compaction
-//                                       will use later on)
-//
-// Every terminated path has a zero throughput unless it ended on an emitter, in
-// which case the throughput *is* the radiance it picked up. That keeps
-// finalGather a blind `image[pixelIndex] += color` over the whole array until
-// stream compaction is wired in.
+// remainingBounces > 0: may scatter; == 0: out of scattering budget but may
+// still see an emitter; < 0: terminated - the stream compaction predicate.
 __global__ void shadeMaterials(
     int iter,
     int depth,
@@ -1638,7 +1892,11 @@ __global__ void shadeMaterials(
         unsigned long long* rrDecisions,
     unsigned long long* rrKills,
     unsigned long long* rrSurvivalMilli,
-    glm::vec3* image)
+    glm::vec3* image,
+    const BvhNode* bvhNodes,
+    const int* bvhPrimitiveIds,
+    glm::vec3* firstNormal,
+    glm::vec3* firstAlbedo)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths)
@@ -1657,16 +1915,15 @@ __global__ void shadeMaterials(
 
     ShadeableIntersection intersection = shadeableIntersections[idx];
 
-    // (1) Ray escaped the scene: it sees the environment light, if the scene has
-    //     one. That is the only way to find the dome - as background and as the
-    //     light of an open scene.
+    // (1) Ray escaped the scene: it sees the environment light (the dome), which
+    //     is the only way to find it - as background and as the light of an open
+    //     scene
     if (intersection.t <= 0.0f)
     {
         const glm::vec3 rayDirection = glm::normalize(pathSegment.ray.direction);
         glm::vec3 radiance = environmentRadiance(environment, rayDirection);
-        // The sun is a disc at infinity and a ray can walk into it too, so this
-        // gets the same MIS weight the estimator uses. The dome has no second
-        // strategy and needs none.
+        // A ray can walk into the sun disc too, so it gets the same MIS weight
+        // the estimator uses; the dome has no second strategy and needs none
         if (insideDistantLight(distantLight, rayDirection))
         {
             float weight = 1.0f;
@@ -1695,13 +1952,17 @@ __global__ void shadeMaterials(
 
     Material material = materials[intersection.materialId];
 
-    // (2) Ray hit an emitter. This is where radiance enters the image: add the
-    //     weighted emission straight into the pixel accumulator and terminate
-    //     (an ideal emitter neither reflects nor transmits what hits it).
-    //
-    //     Accumulating here rather than in a final gather over the path array is
-    //     what makes stream compaction legal: terminated paths are removed from
-    //     the arrays, so no later pass may depend on them still being there.
+    // Denoiser guides: written at the first bounce only, and overwritten every
+    // iteration with the same value - they are a property of the geometry
+    if (depth == 0)
+    {
+        firstNormal[pathSegment.pixelIndex] = intersection.surfaceNormal;
+        firstAlbedo[pathSegment.pixelIndex] = material.color;
+    }
+
+    // (2) Ray hit an emitter: add the weighted emission to the pixel accumulator
+    //     and terminate. Accumulating here, not in a final gather over the path
+    //     array, is what lets compaction drop terminated paths.
     if (material.emittance > 0.0f)
     {
         glm::vec3 contribution = pathSegment.color * material.color * material.emittance;
@@ -1783,10 +2044,8 @@ __global__ void shadeMaterials(
     glm::vec3 intersect = pathSegment.ray.origin
         + intersection.t * glm::normalize(pathSegment.ray.direction);
 
-    // Procedural texture: map the hit point back into object space (which is
-    // where the pattern is defined, so it is attached to the object and follows
-    // its transform) and modulate the albedo by the pattern. Emitters returned
-    // above, so this only ever changes the diffuse/specular colour of a surface.
+    // Procedural texture: the pattern is defined in object space, so map the hit
+    // point back there and modulate the albedo.
     if (material.textureType > 0 && intersection.geomId >= 0)
     {
         const Geom& geom = geoms[intersection.geomId];
@@ -1797,9 +2056,8 @@ __global__ void shadeMaterials(
     }
 
     // (4) Regular surface: evaluate the BSDF to update the throughput and
-    //     generate the next ray. Seeding by (iteration, pixel, depth) keeps the
-    //     samples of one pixel independent across iterations while still being
-    //     reproducible.
+    //     generate the next ray. Seeding by (iteration, pixel, depth) makes a
+    //     pixel's samples independent across iterations but reproducible.
     thrust::default_random_engine rng =
         makeSeededRandomEngine(iter, pathSegment.pixelIndex, depth);
     thrust::uniform_real_distribution<float> lightU01(0.0f, 1.0f);
@@ -1812,11 +2070,9 @@ __global__ void shadeMaterials(
     }
 
     // --- Direct lighting (next event estimation) -------------------------
-    // A diffuse vertex connects straight to a random point on a light: sample the
-    // light, convert the density to solid angle, evaluate the BSDF there and
-    // reject the sample if the segment is blocked. MIS folds in the path's own
-    // emitter hits, which needs a lobe with a density to aim at the light - a
-    // mirror or a dielectric can only find one by accident.
+    // Sample a point on a light, evaluate the BSDF towards it and reject it if
+    // the segment is blocked. MIS folds in the path's own emitter hits, so only
+    // a vertex with a non-delta lobe can take part.
     const bool connectableVertex = bsdfHasNonDeltaLobe(material);
 #if DIRECT_LIGHT_SAMPLING
     const bool areaLightsEnabled = (lightCount > 0 && totalLightArea > 0.0f);
@@ -1837,8 +2093,8 @@ __global__ void shadeMaterials(
         {
             // --- The distant light: aim at the disc ------------------------
             // Every sample lands on the disc, and an unblocked shadow ray also
-            // says the direction missed any area light - which is what lets the
-            // two parts of the strategy share one density.
+            // says the direction missed any area light, so both parts share one
+            // density.
             const glm::vec3 wi = sampleDistantLight(distantLight, su0, su1);
             const float cosSurface = glm::dot(normal, wi);
             const float lightPdf = sunChance * distantLightPdf(distantLight, wi);
@@ -1848,7 +2104,8 @@ __global__ void shadeMaterials(
             {
                 outcome = LIGHT_REJECT_OCCLUDED;
                 const glm::vec3 shadowOrigin = intersect + normal * 1e-3f;
-                if (!isOccluded(geoms, geomCount, shadowOrigin, wi, 1e30f, -1))
+                if (!isOccluded(geoms, geomCount, shadowOrigin, wi, 1e30f, -1, bvhNodes,
+                        bvhPrimitiveIds))
                 {
                     float bsdfDensity = 0.0f;
                     const glm::vec3 f = bsdfEval(material, normal, wo, wi, bsdfDensity);
@@ -1885,10 +2142,9 @@ __global__ void shadeMaterials(
             const glm::vec3 wi = toLight / distance;
             const float cosSurface = glm::dot(normal, wi);
             const float cosLight = glm::dot(lightNormal, -wi);
-            // cosLight > 0 means the renderer can see this part of the light: a ray
-            // towards an away-facing face would enter the box through a nearer one
-            // first. Half of all samples land there; dropping them is what makes
-            // the estimator match the renderer instead of lighting twice.
+            // cosLight > 0 means the renderer can see this part of the light: a
+            // ray towards an away-facing face enters the box through a nearer
+            // one first
             LightSampleOutcome outcome = LIGHT_REJECT_COS_SURFACE;
             double sampleEnergy = 0.0;
             if (cosSurface > 0.0f)
@@ -1897,15 +2153,15 @@ __global__ void shadeMaterials(
                 if (cosLight > 0.0f)
                 {
                     outcome = LIGHT_REJECT_OCCLUDED;
-                    // Density for the whole light strategy: the picked surface
-                    // light, plus the sun's density if its disc covers this
-                    // direction too.
+                    // Density for the whole strategy: the picked area light plus
+                    // the sun, whose disc may cover this direction too
                     const float areaDensity = lightSampleSolidAnglePdf(lights[lightIndex],
                         lightCount, intersect, lightPoint, lightNormal);
                     const float lightPdf = lightStrategyPdf(distantLight, sunChance, areaDensity, wi);
                     const glm::vec3 shadowOrigin = intersect + normal * 1e-3f;
                     const int shadowSkip = LIGHT_SKIP_SELF_IN_SHADOW ? lightGeom : -1;
-                    if (!isOccluded(geoms, geomCount, shadowOrigin, wi, distance - 1e-3f, shadowSkip))
+                    if (!isOccluded(geoms, geomCount, shadowOrigin, wi, distance - 1e-3f, shadowSkip,
+                            bvhNodes, bvhPrimitiveIds))
                     {
                         // The light strategy chose the direction; the BSDF density
                         // is what the path would have produced for it - the other
@@ -1941,30 +2197,20 @@ __global__ void shadeMaterials(
     (void)foldedAboveLedger;
     (void)foldedFaceLedger;
 #endif
-    // NOTE: the low discrepancy sequence is deliberately *not* used for the path
-    // dimensions. Measured, not assumed: pointing it at the BSDF and the roulette
-    // made a 200 spp Cornell render worse rather than better (RMSE 34.6 against
-    // 11.6 for random draws, and visibly grainier), which is the known failure of
-    // a Halton sequence in a high dimensional integral whose effective dimension
-    // changes from sample to sample. The pixel and lens dimensions, where it
-    // provably helps, are handled in generateRayFromCamera.
+    // The low discrepancy sequence is deliberately *not* used for the path
+    // dimensions: measured, it made a 200 spp Cornell render worse (RMSE 34.6
+    // against 11.6 for random draws) - the known failure of a Halton sequence in
+    // an integral whose effective dimension changes from sample to sample. Only
+    // the pixel and lens dimensions, handled in generateRayFromCamera, use it.
 
     scatterRay(pathSegment, intersect, intersection.surfaceNormal,
         intersection.outside != 0, material, rng);
 
 #if RUSSIAN_ROULETTE
     // --- Russian roulette ------------------------------------------------
-    // Every path that is still alive after a few bounces is given a survival
-    // probability equal to its throughput (clamped), and the survivors' weight is
-    // divided by that probability. Cheap, low-contribution paths therefore die
-    // early while the estimator stays unbiased:
-    //
-    //   E[killed? 0 : throughput / p] = p * (throughput / p) = throughput
-    //
-    // A path whose throughput is already tiny (a dark surface, a long chain of
-    // bounces) keeps contributing with a small probability instead of costing a
-    // full intersection + shading pass every iteration. This is the colour
-    // dependent version of the roulette in the specular/BSDF lobes above.
+    // Survive with p = throughput and divide the survivors by p, which keeps the
+    // estimator unbiased: E[killed ? 0 : throughput / p] = throughput. A dim path
+    // then costs a full bounce only rarely.
     if (depth >= RR_MIN_DEPTH)
     {
         const float throughput = glm::max(pathSegment.color.x,
@@ -2000,20 +2246,11 @@ __global__ void shadeMaterials(
     pathSegment.remainingBounces--;
 }
 
-// Add the current iteration's output to the overall image
-// NOTE: the original base code accumulated here with a "finalGather" pass over
-// the path array. That is incompatible with stream compaction (terminated paths
-// - which are exactly the ones that carry radiance - have already been removed
-// from the array by then), so the contribution is now added by shadeMaterials
-// at the moment a ray hits an emitter. `image` still holds the running sum of
-// the samples, which is what sendImageToPBO / saveImage divide by `iter`.
-
 // ---------------------------------------------------------------------------
-// Stream compaction (Project 2 implementation, driven from here)
+// Stream compaction
 // ---------------------------------------------------------------------------
 
-// Predicate: 1 = path may still do something (scatter, or still see an emitter
-// because it is on its last segment), 0 = terminated and can be removed.
+// Predicate to mark the surviving paths
 __global__ void kernMarkAlivePaths(int n, int* alive, const PathSegment* paths)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2023,9 +2260,7 @@ __global__ void kernMarkAlivePaths(int n, int* alive, const PathSegment* paths)
     }
 }
 
-// Scatter the surviving paths with the prefix-sum indices computed from the
-// predicate. PathSegments and ShadeableIntersections are mirrored arrays, so
-// they are compacted with the same index map to stay in sync.
+// Scatter the surviving paths with the prefix-sum indices
 __global__ void kernScatterAlivePaths(
     int n, PathSegment* odata, const PathSegment* idata, const int* alive, const int* indices)
 {
@@ -2047,17 +2282,7 @@ __global__ void kernScatterAliveIntersections(
     }
 }
 
-/**
- * Remove the terminated paths from the working arrays.
- *
- * map -> scan -> scatter:
- *   1. kernMarkAlivePaths       builds the 1/0 predicate
- *   2. StreamCompaction::Efficient::scanDevice  (Project 2 work-efficient
- *      Blelloch scan) turns it into exclusive prefix-sum indices
- *   3. kernScatterAlive*        moves the survivors into the destination arrays
- *
- * Returns the number of surviving paths.
- */
+// Remove the terminated paths from the working arrays
 static int compactPaths(
     int numPaths,
     PathSegment* paths,
@@ -2068,18 +2293,12 @@ static int compactPaths(
     const int blockSize = 128;
     const dim3 blocks((numPaths + blockSize - 1) / blockSize);
 
-    // 1) predicate
+    // predicate
     kernMarkAlivePaths<<<blocks, blockSize>>>(numPaths, dev_alive, paths);
     checkCUDAError("compact: mark alive paths");
 
-    // 2) scan input. The scan runs in place on a power-of-two array with a
-    //    zeroed tail (a requirement of the Project 2 scan), and the extra slot
-    //    at [numPaths] ends up holding the total number of survivors.
+    // scan input
     int m = nextPowerOfTwoAtLeast(numPaths + 1);
-    if (m > h_scanCapacity)
-    {
-        m = h_scanCapacity;
-    }
     cudaMemcpy(dev_scanIndices, dev_alive, numPaths * sizeof(int), cudaMemcpyDeviceToDevice);
     cudaMemset(dev_scanIndices + numPaths, 0, (m - numPaths) * sizeof(int));
     checkCUDAError("compact: prepare scan input");
@@ -2087,23 +2306,203 @@ static int compactPaths(
     StreamCompaction::Efficient::scanDevice(m, dev_scanIndices);
     checkCUDAError("compact: scan");
 
-    // 3) scatter both mirrored arrays with the same indices
+    // scatter both mirrored arrays with the same indices
     kernScatterAlivePaths<<<blocks, blockSize>>>(numPaths, pathsOut, paths, dev_alive, dev_scanIndices);
     kernScatterAliveIntersections<<<blocks, blockSize>>>(
         numPaths, intersectionsOut, intersections, dev_alive, dev_scanIndices);
     checkCUDAError("compact: scatter");
 
-    // 4) number of survivors = exclusive prefix sum at [numPaths]
+    // number of survivors = exclusive prefix sum at [numPaths]
     int numAlive = 0;
     cudaMemcpy(&numAlive, dev_scanIndices + numPaths, sizeof(int), cudaMemcpyDeviceToHost);
     checkCUDAError("compact: read survivor count");
     return numAlive;
 }
 
-/**
- * Wrapper for the __global__ call that sets up the kernel calls and does a ton
- * of memory management
- */
+// ---------------------------------------------------------------------------
+// Sorting the paths by material (Part 1 core feature)
+// ---------------------------------------------------------------------------
+
+// Key of a path: 0 for a ray that hit nothing (those all take the same small
+// "sees the environment" branch), otherwise 1 + material id.
+#if SORT_BY_MATERIAL || MATERIAL_SORT_STATS
+__global__ void kernMaterialSortKeys(
+    int n, const ShadeableIntersection* intersections, int materialCount, int* keys)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n)
+    {
+        const int lastMaterial = materialCount > 0 ? materialCount - 1 : 0;
+        const int materialId = glm::clamp(intersections[index].materialId, 0, lastMaterial);
+        keys[index] = (intersections[index].t > 0.0f) ? 1 + materialId : 0;
+    }
+}
+#endif
+
+#if SORT_BY_MATERIAL
+// One counter per bucket. The bucket count is the number of materials, so a
+// plain atomic histogram over shared memory buys nothing at this size.
+__global__ void kernCountMaterials(int n, const int* keys, int* counts)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n)
+    {
+        atomicAdd(&counts[keys[index]], 1);
+    }
+}
+
+// Move every path into its material's run and take its intersection along. The
+// atomic cursor makes the order *inside* a run arbitrary, which is fine: a path
+// carries its own pixel index, RNG seed and throughput.
+__global__ void kernScatterByMaterial(
+    int n,
+    PathSegment* paths,
+    PathSegment* pathsOut,
+    ShadeableIntersection* intersections,
+    ShadeableIntersection* intersectionsOut,
+    const int* keys,
+    int* cursors)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < n)
+    {
+        const int destination = atomicAdd(&cursors[keys[index]], 1);
+        pathsOut[destination] = paths[index];
+        intersectionsOut[destination] = intersections[index];
+    }
+}
+#endif
+
+#if MATERIAL_SORT_STATS
+// The share of 32-lane warps that see a single material, plus the mean and worst
+// number of materials per warp. Taken on the host from the same keys the sort
+// uses, so it never touches the shading kernel it is explaining.
+static void reportMaterialMix(int numPaths, const ShadeableIntersection* intersections,
+    int materialCount, const char* tag)
+{
+    if (numPaths <= 0 || (int)h_materialKeys.size() < numPaths)
+    {
+        return;
+    }
+
+    const int blockSize = 128;
+    const dim3 blocks((numPaths + blockSize - 1) / blockSize);
+    kernMaterialSortKeys<<<blocks, blockSize>>>(numPaths, intersections, materialCount,
+        dev_materialKeys);
+    cudaMemcpy(h_materialKeys.data(), dev_materialKeys, numPaths * sizeof(int),
+        cudaMemcpyDeviceToHost);
+    checkCUDAError("sort stats: keys");
+
+    std::vector<int> histogram(materialCount + 1, 0);
+    for (int i = 0; i < numPaths; i++)
+    {
+        histogram[h_materialKeys[i]]++;
+    }
+
+    int warps = 0;
+    int uniformWarps = 0;
+    int worst = 0;
+    long long distinctTotal = 0;
+    for (int warp = 0; warp < numPaths; warp += 32)
+    {
+        const int end = glm::min(warp + 32, numPaths);
+        int distinct = 0;
+        unsigned long long seen = 0ull;
+        for (int i = warp; i < end; i++)
+        {
+            const int key = h_materialKeys[i];
+            if (key < 64)
+            {
+                const unsigned long long bit = 1ull << key;
+                if (seen & bit)
+                {
+                    continue;
+                }
+                seen |= bit;
+            }
+            distinct++;
+        }
+        warps++;
+        distinctTotal += distinct;
+        worst = glm::max(worst, distinct);
+        if (distinct == 1)
+        {
+            uniformWarps++;
+        }
+    }
+
+    printf("[sort] %s: %d paths, %.1f%% of the %d warps see one material (mean %.2f, worst %d);"
+        " hits", tag, numPaths, 100.0 * uniformWarps / warps, warps,
+        (double)distinctTotal / warps, worst);
+    for (int bucket = 0; bucket < (int)histogram.size(); bucket++)
+    {
+        printf(" m%d=%.1f%%", bucket, 100.0 * histogram[bucket] / numPaths);
+    }
+    printf("\n");
+}
+#endif
+
+#if SORT_BY_MATERIAL
+/** Reorder (paths, intersections) so that the paths which hit the same material
+ *  sit next to each other: a warp holding a mix of them runs the shading branches
+ *  one after the other with the other lanes masked off. Costs key, histogram,
+ *  scan and scatter after every bounce; a permutation, so nothing is dropped. */
+static int sortPathsByMaterial(
+    int numPaths,
+    PathSegment* paths,
+    PathSegment* pathsOut,
+    ShadeableIntersection* intersections,
+    ShadeableIntersection* intersectionsOut,
+    int materialCount,
+    bool reportMix)
+{
+#if !MATERIAL_SORT_STATS
+    (void)reportMix;
+#endif
+    const int bucketCount = materialCount + 1;      // bucket 0 = escaped the scene
+    const int blockSize = 128;
+    const dim3 blocks((numPaths + blockSize - 1) / blockSize);
+
+    // 1) key
+    kernMaterialSortKeys<<<blocks, blockSize>>>(numPaths, intersections, materialCount,
+        dev_materialKeys);
+    checkCUDAError("sort: material keys");
+
+    // 2) histogram
+    cudaMemset(dev_bucketCounts, 0, bucketCount * sizeof(int));
+    kernCountMaterials<<<blocks, blockSize>>>(numPaths, dev_materialKeys, dev_bucketCounts);
+    checkCUDAError("sort: histogram");
+
+    // 3) exclusive prefix sum of the histogram -> the start of each run, on a
+    //    power-of-two array with a zeroed tail, exactly as in compactPaths
+    const int m = nextPowerOfTwoAtLeast(bucketCount + 1);
+    cudaMemcpy(dev_bucketOffsets, dev_bucketCounts, bucketCount * sizeof(int),
+        cudaMemcpyDeviceToDevice);
+    cudaMemset(dev_bucketOffsets + bucketCount, 0, (m - bucketCount) * sizeof(int));
+    StreamCompaction::Efficient::scanDevice(m, dev_bucketOffsets);
+    checkCUDAError("sort: bucket scan");
+    cudaMemcpy(dev_bucketCursors, dev_bucketOffsets, bucketCount * sizeof(int),
+        cudaMemcpyDeviceToDevice);
+
+    // 4) scatter
+    kernScatterByMaterial<<<blocks, blockSize>>>(numPaths, paths, pathsOut, intersections,
+        intersectionsOut, dev_materialKeys, dev_bucketCursors);
+    checkCUDAError("sort: scatter");
+
+#if MATERIAL_SORT_STATS
+    // Keys again, this time of the sorted intersections, so the two reports are
+    // the same measurement on either side of the permutation.
+    if (reportMix)
+    {
+        reportMaterialMix(numPaths, intersectionsOut, materialCount, "after the sort");
+    }
+#endif
+
+    return numPaths;
+}
+#endif
+
+/** One iteration: trace, sort, shade, compact - then add the result to the image. */
 void pathtrace(uchar4* pbo, int frame, int iter)
 {
     const int traceDepth = hst_scene->state.traceDepth;
@@ -2121,50 +2520,18 @@ void pathtrace(uchar4* pbo, int frame, int iter)
 
     ///////////////////////////////////////////////////////////////////////////
 
-    // Recap:
-    // * Initialize array of path rays (using rays that come out of the camera)
-    //   * You can pass the Camera object to that kernel.
-    //   * Each path ray must carry at minimum a (ray, color) pair,
-    //   * where color starts as the multiplicative identity, white = (1, 1, 1).
-    //   * This has already been done for you.
-    // * For each depth:
-    //   * Compute an intersection in the scene for each path ray.
-    //     A very naive version of this has been implemented for you, but feel
-    //     free to add more primitives and/or a better algorithm.
-    //     Currently, intersection distance is recorded as a parametric distance,
-    //     t, or a "distance along the ray." t = -1.0 indicates no intersection.
-    //     * Color is attenuated (multiplied) by reflections off of any object
-    //   * TODO: Stream compact away all of the terminated paths.
-    //     You may use either your implementation or `thrust::remove_if` or its
-    //     cousins.
-    //     * Note that you can't really use a 2D kernel launch any more - switch
-    //       to 1D.
-    //   * TODO: Shade the rays that intersected something or didn't bottom out.
-    //     That is, color the ray by performing a color computation according
-    //     to the shader, then generate a new ray to continue the ray path.
-    //     We recommend just updating the ray's PathSegment in place.
-    //     Note that this step may come before or after stream compaction,
-    //     since some shaders you write may also cause a path to terminate.
-    // * Finally, add this iteration's results to the image. This has been done
-    //   for you.
-
-    // TODO: perform one iteration of path tracing
-
     generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths);
     checkCUDAError("generate camera ray");
 
     // Segments traced per sample: the camera ray plus up to `traceDepth`
-    // scattering events. The final segment can no longer scatter - it only
-    // exists so that the path may still directly hit an emitter.
+    // scattering events; the last one exists only to hit an emitter
     const int maxSegments = traceDepth + 1;
 
     int depth = 0;
     int num_paths = pixelcount;
 
-    // Working arrays. With stream compaction the two pairs ping-pong: the
-    // survivors are scattered into the alternate arrays, which become the input
-    // of the next bounce. Without compaction the pointers never move and dead
-    // rays are simply skipped inside the kernels.
+    // Working arrays: with compaction the two pairs ping-pong, so the survivors
+    // scattered into the "other" arrays become the next bounce's input
     PathSegment* paths = dev_paths;
     PathSegment* pathsOther = dev_pathsAlt;
     ShadeableIntersection* intersections = dev_intersections;
@@ -2180,6 +2547,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
 
         // tracing
+        stageTrace.begin();
         computeIntersections<<<numblocksPathSegmentTracing, blockSize1d>>> (
             depth,
             num_paths,
@@ -2188,16 +2556,50 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             hst_scene->geoms.size(),
             intersections,
             dev_sdfSteps,
-            dev_sdfHistogram
+            dev_sdfHistogram,
+            h_bvhActive ? dev_bvhNodes : NULL,
+            h_bvhActive ? dev_bvhPrimitiveIds : NULL
         );
+        stageTrace.end();
         checkCUDAError("trace one bounce");
 
+        // --- Sorting stage ---
+        // Reorder the pairs into one run per material so that the shading
+        // kernel's per-material branches are warp-uniform. SORT_BY_MATERIAL 0 is
+        // the "shaded directly" side of the comparison the base code asked for.
+#if MATERIAL_SORT_STATS || SORT_BY_MATERIAL
+        // How mixed the warps are as the paths stand, measured on bounces 1 and 6
+        // of the first iteration
+        const bool reportMix = MATERIAL_SORT_STATS && iter == 1
+            && (depth == 0 || depth == 5);
+#endif
+#if MATERIAL_SORT_STATS
+        if (reportMix)
+        {
+            char tag[32];
+            snprintf(tag, sizeof(tag), "bounce %d, before", depth + 1);
+            reportMaterialMix(num_paths, intersections, (int)hst_scene->materials.size(), tag);
+        }
+#endif
+#if SORT_BY_MATERIAL
+        stageSort.begin();
+        sortPathsByMaterial(num_paths, paths, pathsOther, intersections, intersectionsOther,
+            (int)hst_scene->materials.size(), reportMix);
+        stageSort.end();
+        {
+            PathSegment* tmpPaths = paths;
+            paths = pathsOther;
+            pathsOther = tmpPaths;
+            ShadeableIntersection* tmpIntersections = intersections;
+            intersections = intersectionsOther;
+            intersectionsOther = tmpIntersections;
+        }
+#endif
+
         // --- Shading Stage ---
-        // Evaluate the BSDF of the hit material, accumulate the contribution of
-        // emitter hits into dev_image and generate the next ray for each
-        // still-living path segment.
-        // TODO: compare between directly shading the path segments and shading
-        // path segments that have been reshuffled to be contiguous in memory.
+        // Evaluate the BSDF, accumulate emitter hits into dev_image and generate
+        // the next ray of every still-living path
+        stageShade.begin();
         shadeMaterials<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
             depth,
@@ -2220,15 +2622,18 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_rrDecisions,
             dev_rrKills,
             dev_rrSurvivalMilli,
-            dev_image
+            dev_image,
+            h_bvhActive ? dev_bvhNodes : NULL,
+            h_bvhActive ? dev_bvhPrimitiveIds : NULL,
+            dev_firstNormal,
+            dev_firstAlbedo
         );
+        stageShade.end();
         checkCUDAError("shade one bounce");
 
         depth++;
 
-#if STREAM_COMPACTION
-        // Drop the terminated paths so the next bounce only launches threads
-        // for rays that can still reach a light.
+#if STREAM_COMPACTION // Drop the terminated paths to reduce the number of active threads
         num_paths = compactPaths(num_paths, paths, pathsOther, intersections, intersectionsOther);
         {
             PathSegment* tmpPaths = paths;
@@ -2240,22 +2645,12 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         }
 #endif
 
-        if (guiData != NULL)
-        {
-            guiData->TracedDepth = depth;
-        }
-
-        // README instrumentation: rays still processed after this bounce. With
-        // compaction this is the number of unterminated rays; without it, it
-        // stays at the full pixel count even though most rays are already dead.
-        if (depth <= MAX_PROFILE_DEPTH)
-        {
-            h_bounceAlive[depth - 1] += num_paths;
-        }
+		// --- Bounce profile statistics ---
+        if (guiData != NULL) { guiData->TracedDepth = depth; }
+        if (depth <= MAX_PROFILE_DEPTH) { h_bounceAlive[depth - 1] += num_paths; }
     }
 
-    // README instrumentation: the per-bounce profile of a single iteration, plus
-    // the average over the whole render.
+	// --- Iteration statistics ---
     h_profileIters++;
     if (iter == 1)
     {
@@ -2269,19 +2664,11 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         printSdfStats(pixelcount);
         printRussianRouletteStats(pixelcount);
         printDirectLightStats(pixelcount);
+        printStageTimings();
     }
-
-    ///////////////////////////////////////////////////////////////////////////
 
     // Send results to OpenGL buffer for rendering
     sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
-
-    // NOTE: the base code copied the whole accumulation buffer back to the host
-    // here, after every single iteration, because saveImage() reads it from
-    // there. That is 7.7 MB of PCIe traffic per iteration at 800x800 for data
-    // that is only read when the user saves - or, now, when a checkpoint is due.
-    // The copy moved to pathtraceFetchImage(), which saveImage() and the
-    // checkpointer call on demand.
 
     checkCUDAError("pathtrace");
 }

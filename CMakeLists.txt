@@ -52,9 +52,12 @@ find_package(GLM REQUIRED)
 include_directories(${GLM_INCLUDE_DIRS})
 
 set(headers
+    src/bvh.h
+    src/denoise.h
     src/image.h
     src/interactions.h
     src/intersections.h
+    src/mesh.h
     src/glslUtility.hpp
     src/pathtrace.h
     src/scene.h
@@ -65,11 +68,14 @@ set(headers
 set(sources
     src/main.cpp
     src/stb.cpp
+    src/bvh.cpp
+    src/denoise.cpp
     src/image.cpp
     src/glslUtility.cpp
     src/pathtrace.cu
     src/intersections.cu
     src/interactions.cu
+    src/mesh.cpp
     src/scene.cpp
     src/utilities.cpp
 )
@@ -126,4 +132,33 @@ target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE
 target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<PLATFORM_ID:Windows>>:/Zc:preprocessor>")
 
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${CMAKE_PROJECT_NAME})
+
+# ---------------------------------------------------------------------------
+# Intel Open Image Denoise (optional)
+#
+# The renderer builds without it. Unpack the prebuilt Windows release
+# (https://github.com/RenderKit/oidn/releases) into external/ as
+#   external/oidn-<version>.x64.windows/
+# and the build picks it up: a denoised image is written next to every saved
+# render, using the first hit's normal and albedo as guides. The DLLs are copied
+# next to the executable because the package ships them as plugins (a CUDA one
+# and a CPU one, which is why denoising can run on the GPU).
+file(GLOB OIDN_CANDIDATES "${CMAKE_SOURCE_DIR}/external/oidn-*.x64.windows")
+list(LENGTH OIDN_CANDIDATES OIDN_CANDIDATE_COUNT)
+if(OIDN_CANDIDATE_COUNT GREATER 0)
+    list(GET OIDN_CANDIDATES 0 OIDN_ROOT)
+endif()
+if(OIDN_ROOT AND EXISTS "${OIDN_ROOT}/include/OpenImageDenoise/oidn.h"
+        AND EXISTS "${OIDN_ROOT}/lib/OpenImageDenoise.lib")
+    message(STATUS "Open Image Denoise: ${OIDN_ROOT}")
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE USE_OIDN=1)
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${OIDN_ROOT}/include")
+    target_link_libraries(${CMAKE_PROJECT_NAME} "${OIDN_ROOT}/lib/OpenImageDenoise.lib")
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory "${OIDN_ROOT}/bin"
+            "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>"
+        COMMENT "Copying the Open Image Denoise runtime next to the executable")
+else()
+    message(STATUS "Open Image Denoise: not found in external/, building without it")
+endif()
 
