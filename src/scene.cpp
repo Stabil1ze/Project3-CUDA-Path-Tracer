@@ -1,11 +1,13 @@
 #include "scene.h"
 
+#include "mesh.h"
 #include "utilities.h"
 
 #include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtx/string_cast.hpp>
 #include "json.hpp"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -13,6 +15,19 @@
 
 using namespace std;
 using json = nlohmann::json;
+
+namespace
+{
+    std::string resolveAssetPath(const std::string& sceneDir, const std::string& file)
+    {
+        const std::filesystem::path path(file);
+        if (path.is_absolute() || sceneDir.empty())
+        {
+            return path.string();
+        }
+        return (std::filesystem::path(sceneDir) / path).lexically_normal().string();
+    }
+}
 
 Scene::Scene(string filename)
 {
@@ -36,9 +51,9 @@ void Scene::loadFromJSON(const std::string& jsonName)
     std::ifstream f(jsonName);
     json data = json::parse(f);
 
-    // Environment light (optional): rays that leave the scene see the sky
-    // gradient above the horizon and the ground colour below it. No block =
-    // black background.
+    const std::string sceneDir = std::filesystem::path(jsonName).parent_path().string();
+
+    // Environment light handler
     state.environment.zenith = glm::vec3(0.0f);
     state.environment.horizon = glm::vec3(0.0f);
     state.environment.ground = glm::vec3(0.0f);
@@ -68,8 +83,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
             << "), intensity " << state.environment.intensity << endl;
     }
 
-    // Distant light (optional): a sun of angular radius ANGULAR_RADIUS degrees
-    // travelling in DIRECTION. No block = no distant light.
+    // Distant light handler
     state.distantLight.enabled = 0;
     state.distantLight.direction = glm::vec3(0.0f, -1.0f, 0.0f);
     state.distantLight.radiance = glm::vec3(0.0f);
@@ -106,10 +120,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
         const auto& col = p["RGB"];
         newMaterial.color = glm::vec3(col[0], col[1], col[2]);
 
-        // "TYPE" decides which BSDF lobe(s) the material has. The weight fields
-        // below are what scatterRay uses to probabilistically pick a lobe, so a
-        // material may combine several of them later on (e.g. glossy = diffuse
-        // + imperfect specular) without touching the tracing code.
+        // TYPE decides which BSDF lobe(s) the material has
         if (p["TYPE"] == "Diffuse")
         {
             // albedo only: the random walk is chosen by scatterRay.
@@ -120,27 +131,20 @@ void Scene::loadFromJSON(const std::string& jsonName)
         }
         else if (p["TYPE"] == "Specular")
         {
-            // Perfect mirror by default: ROUGHNESS 0 means the reflected
-            // direction is used as-is, a larger value is the hook for the
-            // "imperfect specular" extension (GPU Gems 3, Ch. 20).
+            // Perfect mirror by default
             newMaterial.hasReflective = 1.0f;
             newMaterial.specular.color = newMaterial.color;
             newMaterial.specular.exponent = p.value("ROUGHNESS", 0.0f);
         }
         else if (p["TYPE"] == "Refractive")
         {
-            // Dielectric (glass/water): Fresnel-weighted reflection plus
-            // refraction through IOR, handled in scatterRay. IOR 1.5 is window
-            // glass, 1.33 water, 2.4 diamond.
+            // Dielectric (glass/water)
             newMaterial.hasRefractive = 1.0f;
             newMaterial.indexOfRefraction = p.value("IOR", 1.5f);
-            // The material colour tints the dielectric lobe.
             newMaterial.specular.color = newMaterial.color;
         }
 
-        // Optional procedural texture for the diffuse albedo. It is evaluated on
-        // the object space hit point (see interactions.cu), and TEXSCALE sets how
-        // many pattern cells fit into one object space unit.
+        // Optional procedural texture for the diffuse albedo
         const std::string texture = p.value("TEXTURE", std::string("none"));
         if (texture == "checker")
         {
@@ -164,7 +168,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
     for (const auto& p : objectsData)
     {
         const auto& type = p["TYPE"];
-        Geom newGeom;
+        Geom newGeom{};
         if (type == "cube")
         {
             newGeom.type = CUBE;
@@ -180,6 +184,34 @@ void Scene::loadFromJSON(const std::string& jsonName)
         else if (type == "sphere")
         {
             newGeom.type = SPHERE;
+        }
+        else if (type == "mesh")
+        {
+            const std::string file = p.value("FILE", std::string());
+            if (file.empty())
+            {
+                cout << "Object TYPE 'mesh' without a FILE field, skipping it" << endl;
+                continue;
+            }
+            const auto& meshTrans = p["TRANS"];
+            const auto& meshRotat = p["ROTAT"];
+            const auto& meshScale = p["SCALE"];
+            const int before = (int)geoms.size();
+            const int loaded = loadMesh(resolveAssetPath(sceneDir, file),
+                glm::vec3(meshTrans[0], meshTrans[1], meshTrans[2]),
+                glm::vec3(meshRotat[0], meshRotat[1], meshRotat[2]),
+                glm::vec3(meshScale[0], meshScale[1], meshScale[2]),
+                (int)MatNameToID[p["MATERIAL"]], geoms);
+            if (loaded < 0)
+            {
+                cout << "Object TYPE 'mesh' could not load " << file << ", skipping it" << endl;
+            }
+            else
+            {
+                cout << "  mesh " << p["MATERIAL"].get<std::string>() << " added "
+                     << (int)geoms.size() - before << " triangle geometries" << endl;
+            }
+            continue;
         }
         else
         {
@@ -210,9 +242,10 @@ void Scene::loadFromJSON(const std::string& jsonName)
     state.traceDepth = cameraData["DEPTH"];
     state.imageName = cameraData["FILE"];
 
-    // Restartable rendering: how often the accumulated image is written to
-    // "<FILE>.ckpt" while the render runs, in seconds. 0 turns it off.
+	// Restartable rendering interval, in seconds
     state.checkpointInterval = cameraData.value("CHECKPOINT", 30.0f);
+    // Write-out frames for animations in the write-up, in seconds
+    state.frameInterval = cameraData.value("FRAMES", 0.0f);
 
     const auto& pos = cameraData["EYE"];
     const auto& lookat = cameraData["LOOKAT"];
@@ -221,10 +254,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
     camera.lookAt = glm::vec3(lookat[0], lookat[1], lookat[2]);
     camera.up = glm::vec3(up[0], up[1], up[2]);
 
-    // Depth of field (optional). "APERTURE" is the lens radius in world units
-    // and "FOCUS" the distance of the focal plane; without them the camera is a
-    // pinhole. A missing FOCUS is taken as the distance to the look-at point,
-    // which is the usual "the thing I am looking at is sharp" behaviour.
+    // Depth of field
     camera.aperture = cameraData.value("APERTURE", 0.0f);
     camera.focalDistance = cameraData.value("FOCUS", glm::length(camera.lookAt - camera.position));
 
@@ -234,16 +264,12 @@ void Scene::loadFromJSON(const std::string& jsonName)
     float fovx = (atan(xscaled) * 180) / PI;
     camera.fov = glm::vec2(fovx, fovy);
 
-    // The basis has to be derived from the view direction, so that one must be
-    // known first - "up" only fixes the roll of the camera frame. Building
-    // `right` out of a not-yet-computed `view` yields a cross product of two
-    // zero vectors, i.e. NaNs in every ray direction.
     camera.view = glm::normalize(camera.lookAt - camera.position);
     camera.right = glm::normalize(glm::cross(camera.view, camera.up));
     camera.pixelLength = glm::vec2(2 * xscaled / (float)camera.resolution.x,
         2 * yscaled / (float)camera.resolution.y);
 
-    //set up render camera stuff
+    //set up render camera
     int arraylen = camera.resolution.x * camera.resolution.y;
     state.image.resize(arraylen);
     std::fill(state.image.begin(), state.image.end(), glm::vec3());

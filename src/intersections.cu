@@ -113,12 +113,56 @@ __host__ __device__ float sphereIntersectionTest(
 }
 
 // ---------------------------------------------------------------------------
-// Procedural shapes: signed distance fields
+// Mesh triangles
 // ---------------------------------------------------------------------------
-// Both shapes live in "unit" object space - the Mandelbulb fits in a ball of
-// radius ~1.2, the Menger sponge exactly in the cube [-1, 1]^3 - and are placed
-// by the geometry matrix like any other object. They have no closed form for the
-// hit, so they are intersected by sphere tracing (see sdfIntersectionTest).
+
+__host__ __device__ float triangleIntersectionTest(
+    Geom triangle,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside)
+{
+    Ray q;
+    q.origin = multiplyMV(triangle.inverseTransform, glm::vec4(r.origin, 1.0f));
+    q.direction = glm::normalize(multiplyMV(triangle.inverseTransform, glm::vec4(r.direction, 0.0f)));
+
+    const glm::vec3 edge1 = triangle.v1 - triangle.v0;
+    const glm::vec3 edge2 = triangle.v2 - triangle.v0;
+    const glm::vec3 pvec = glm::cross(q.direction, edge2);
+
+    const float determinant = glm::dot(edge1, pvec);
+    if (glm::abs(determinant) < 1e-12f) { return -1.0f; }
+
+    const float inverseDeterminant = 1.0f / determinant;
+    const glm::vec3 tvec = q.origin - triangle.v0;
+    const float u = glm::dot(tvec, pvec) * inverseDeterminant;
+    if (u < 0.0f || u > 1.0f) { return -1.0f; }
+
+    const glm::vec3 qvec = glm::cross(tvec, edge1);
+    const float v = glm::dot(q.direction, qvec) * inverseDeterminant;
+    if (v < 0.0f || u + v > 1.0f) { return -1.0f; }
+
+    const float t = glm::dot(edge2, qvec) * inverseDeterminant;
+    if (t < 1e-4f) { return -1.0f; }
+
+    const glm::vec3 localPoint = q.origin + t * q.direction;
+    const glm::vec3 localNormal = triangle.n0 * (1.0f - u - v) + triangle.n1 * u + triangle.n2 * v;
+    const glm::vec3 geometricNormal = glm::cross(edge1, edge2);
+
+    intersectionPoint = multiplyMV(triangle.transform, glm::vec4(localPoint, 1.0f));
+    normal = glm::normalize(multiplyMV(triangle.invTranspose, glm::vec4(localNormal, 0.0f)));
+
+    const glm::vec3 faceNormal = multiplyMV(triangle.invTranspose, glm::vec4(geometricNormal, 0.0f));
+    outside = glm::dot(faceNormal, r.direction) < 0.0f;
+    if (!outside) { normal = -normal; }
+
+    return glm::length(r.origin - intersectionPoint);
+}
+
+// ---------------------------------------------------------------------------
+// Procedural shapes
+// ---------------------------------------------------------------------------
 
 __host__ __device__ inline float sdBox(glm::vec3 p, glm::vec3 b)
 {
@@ -127,11 +171,7 @@ __host__ __device__ inline float sdBox(glm::vec3 p, glm::vec3 b)
         + glm::min(glm::max(q.x, glm::max(q.y, q.z)), 0.0f);
 }
 
-/**
- * Power-8 Mandelbulb distance estimate. `z` is the iterated point and `dr`
- * tracks |dz/dc| alongside it, which turns the escape radius into a distance:
- * the classic 0.5 * log(r) * r / dr bound.
- */
+// Mandelbulb SDF from https://www.iquilezles.org/www/articles/mandelbulb/mandelbulb.htm
 __host__ __device__ inline float mandelbulbSDF(glm::vec3 p)
 {
     constexpr float POWER = 8.0f;
@@ -161,10 +201,6 @@ __host__ __device__ inline float mandelbulbSDF(glm::vec3 p)
     return 0.5f * logf(r) * r / dr;
 }
 
-/**
- * Menger sponge: fold the point into one octant, then carve three axis aligned
- * bars out of it, four times over (the classic level-3 sponge).
- */
 __host__ __device__ inline float mengerSDF(glm::vec3 p)
 {
     constexpr int MAX_ITER = 4;
@@ -190,11 +226,6 @@ __host__ __device__ float sdfEvaluate(int geomType, glm::vec3 p)
     return (geomType == MANDELBULB) ? mandelbulbSDF(p) : mengerSDF(p);
 }
 
-/**
- * Largest scale factor of the geometry, i.e. the length of the longest column of
- * its object-to-world matrix. Sphere tracing has to divide its steps by this to
- * stay conservative under a scaled transform.
- */
 __host__ __device__ inline float geomMaxScale(Geom geom)
 {
     float sx = glm::length(glm::vec3(geom.transform[0]));
@@ -225,12 +256,7 @@ __host__ __device__ float sdfIntersectionTest(
     const float shapeRadius = (geom.type == MANDELBULB) ? 1.3f : 1.7320508f;  // sqrt(3)
     const float boundRadius = shapeRadius * maxScale;
 
-    // Broad phase: sphere tracing is expensive, so test the shape's bounding
-    // sphere first and skip the march for every ray that cannot reach it (the
-    // same idea as bounding volume culling for a mesh, and the reason a fractal
-    // sitting in a room does not cost a full march per ray). This is a pure
-    // rejection test - the marching below starts at t = 0 either way, so turning
-    // the toggle off changes the render time but not a single hit.
+    // Broad phase
 #if SDF_BOUNDING_SPHERE
     {
         glm::vec3 oc = rayOrigin - center;
@@ -257,12 +283,9 @@ __host__ __device__ float sdfIntersectionTest(
             hit = true;
             break;
         }
-        // A step of the (scaled) distance estimate can never cross the surface.
         t += glm::max(d * stepScale, HIT_EPSILON);
     }
 
-    // atomicAdd only exists on the device; the host pass of this function is
-    // compiled but never called (the intersection tests are device only).
 #ifdef __CUDA_ARCH__
     if (stepCounter != NULL)
     {
@@ -285,9 +308,7 @@ __host__ __device__ float sdfIntersectionTest(
     glm::vec3 pWorld = rayOrigin + t * rayDirection;
     glm::vec3 pObj = multiplyMV(geom.inverseTransform, glm::vec4(pWorld, 1.0f));
 
-    // Surface normal from the SDF gradient. Four evaluations arranged as the
-    // corners of a tetrahedron instead of the six a per-axis central difference
-    // would need (this is the standard "tetrahedron trick").
+    // Surface normal from the SDF gradient
     const float h = 1e-4f;
     glm::vec3 grad = glm::vec3(0.0f);
     grad += glm::vec3( 1.0f, -1.0f, -1.0f) * sdfEvaluate(geom.type, pObj + glm::vec3( 1.0f, -1.0f, -1.0f) * h);
@@ -297,8 +318,8 @@ __host__ __device__ float sdfIntersectionTest(
     grad = glm::normalize(grad);
     normal = glm::normalize(multiplyMV(geom.invTranspose, glm::vec4(grad, 0.0f)));
 
-    // Sphere tracing assumes it starts outside; if the ray origin is already
-    // below the surface, report the hit from the inside, like the primitives do.
+    // Sphere tracing assumes it starts outside
+    // if the ray origin is already below the surface, report the hit from the inside
     outside = true;
     glm::vec3 originObj = multiplyMV(geom.inverseTransform, glm::vec4(rayOrigin, 1.0f));
     if (sdfEvaluate(geom.type, originObj) < 0.0f)
@@ -309,4 +330,64 @@ __host__ __device__ float sdfIntersectionTest(
 
     intersectionPoint = pWorld;
     return glm::length(rayOrigin - pWorld);
+}
+
+// ---------------------------------------------------------------------------
+// World space bounds of a geometry
+// ---------------------------------------------------------------------------
+
+// Compute the world space axis-aligned bounding box of a geometry
+__host__ void geomWorldBounds(const Geom& geom, glm::vec3& boundsMin, glm::vec3& boundsMax)
+{
+    boundsMin = glm::vec3(FLT_MAX);
+    boundsMax = glm::vec3(-FLT_MAX);
+
+    if (geom.type == TRIANGLE)
+    {
+        const glm::vec3 corners[3] = {
+            multiplyMV(geom.transform, glm::vec4(geom.v0, 1.0f)),
+            multiplyMV(geom.transform, glm::vec4(geom.v1, 1.0f)),
+            multiplyMV(geom.transform, glm::vec4(geom.v2, 1.0f)) };
+        for (int i = 0; i < 3; i++)
+        {
+            boundsMin = glm::min(boundsMin, corners[i]);
+            boundsMax = glm::max(boundsMax, corners[i]);
+        }
+        return;
+    }
+
+    if (geom.type == CUBE)
+    {
+        for (int corner = 0; corner < 8; corner++)
+        {
+            const glm::vec3 unit((corner & 1) ? 0.5f : -0.5f, (corner & 2) ? 0.5f : -0.5f,
+                (corner & 4) ? 0.5f : -0.5f);
+            const glm::vec3 world = multiplyMV(geom.transform, glm::vec4(unit, 1.0f));
+            boundsMin = glm::min(boundsMin, world);
+            boundsMax = glm::max(boundsMax, world);
+        }
+        return;
+    }
+
+    const glm::vec3 center = multiplyMV(geom.transform, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+    glm::vec3 extent(0.5f);
+    if (geom.type == SPHERE)
+    {
+        // glm is column major: m[column][row], so a row of the linear part is
+        // (m[0][r], m[1][r], m[2][r]).
+        for (int axis = 0; axis < 3; axis++)
+        {
+            const glm::vec3 row(geom.transform[0][axis], geom.transform[1][axis],
+                geom.transform[2][axis]);
+            extent[axis] = 0.5f * glm::length(row);
+        }
+    }
+    else
+    {
+        const float shapeRadius = (geom.type == MANDELBULB) ? 1.3f : 1.7320508f;  // sqrt(3)
+        extent = glm::vec3(shapeRadius * geomMaxScale(geom));
+    }
+
+    boundsMin = center - extent;
+    boundsMax = center + extent;
 }

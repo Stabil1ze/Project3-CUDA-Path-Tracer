@@ -1,0 +1,139 @@
+{
+    "Materials":
+    {
+        "light":
+        {
+            "TYPE":"Emitting",
+            "RGB":[1.0, 0.96, 0.9],
+            "EMITTANCE":14.0
+        },
+        "floor":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.62, 0.60, 0.57]
+        },
+        "ceiling":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.88, 0.88, 0.88]
+        },
+        "wall_left":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.16, 0.42, 0.52]
+        },
+        "wall_right":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.72, 0.36, 0.16]
+        },
+        "wall_back":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.82, 0.80, 0.78]
+        },
+        "stone":
+        {
+            "TYPE":"Diffuse",
+            "RGB":[0.78, 0.74, 0.66]
+        },
+        "mirror":
+        {
+            "TYPE":"Specular",
+            "RGB":[0.95, 0.95, 0.95],
+            "ROUGHNESS":0.0
+        },
+        "glass":
+        {
+            "TYPE":"Refractive",
+            "RGB":[0.98, 0.98, 0.98],
+            "IOR":1.5
+        }
+    },
+    "Objects":
+    [
+        {
+            "TYPE":"cube",
+            "MATERIAL":"light",
+            "TRANS":[0.0, 10.0, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[3.0, 0.3, 3.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"floor",
+            "TRANS":[0.0, 0.0, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[10.0, 0.01, 10.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"ceiling",
+            "TRANS":[0.0, 10.0, 0.0],
+            "ROTAT":[0.0, 0.0, 90.0],
+            "SCALE":[0.01, 10.0, 10.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"wall_back",
+            "TRANS":[0.0, 5.0, -5.0],
+            "ROTAT":[0.0, 90.0, 0.0],
+            "SCALE":[0.01, 10.0, 10.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"wall_left",
+            "TRANS":[-5.0, 5.0, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[0.01, 10.0, 10.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"wall_right",
+            "TRANS":[5.0, 5.0, 0.0],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[0.01, 10.0, 10.0]
+        },
+        {
+            "TYPE":"mesh",
+            "FILE":"../assets/meshes/gargoyle.obj",
+            "MATERIAL":"stone",
+            "TRANS":[0.0, 4.35, -1.2],
+            "ROTAT":[0.0, 25.0, 0.0],
+            "SCALE":[4.0, 4.0, 4.0]
+        },
+        {
+            "TYPE":"cube",
+            "MATERIAL":"stone",
+            "TRANS":[0.0, 1.0, -1.2],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[3.4, 2.0, 3.4]
+        },
+        {
+            "TYPE":"sphere",
+            "MATERIAL":"mirror",
+            "TRANS":[-3.2, 1.15, 1.4],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[2.3, 2.3, 2.3]
+        },
+        {
+            "TYPE":"sphere",
+            "MATERIAL":"glass",
+            "TRANS":[3.2, 1.15, 1.4],
+            "ROTAT":[0.0, 0.0, 0.0],
+            "SCALE":[2.3, 2.3, 2.3]
+        }
+    ],
+    "Camera":
+    {
+        "RES":[800, 800],
+        "FOVY":45.0,
+        "ITERATIONS":1500,
+        "DEPTH":8,
+        "FILE":"mesh",
+        "CHECKPOINT":30.0,
+        "EYE":[0.0, 4.4, 11.0],
+        "LOOKAT":[0.0, 3.8, -1.0],
+        "UP":[0.0, 1.0, 0.0]
+    }
+}

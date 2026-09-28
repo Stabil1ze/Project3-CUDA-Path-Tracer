@@ -79,24 +79,37 @@ __host__ __device__ float sphereIntersectionTest(
     glm::vec3& normal,
     bool& outside);
 
-// CHECKITOUT
+/**
+ * Test intersection between a ray and one mesh triangle, Moeller-Trumbore in the
+ * mesh's object space. The barycentric coordinates interpolate the shading
+ * normals and the hit normal goes back to world space with the inverse
+ * transpose. The test is two sided: a hit from behind reports `outside = false`
+ * and a flipped normal, so an open or inverted mesh (a room, a glass shell)
+ * shades correctly instead of going black.
+ *
+ * @param intersectionPoint  Output parameter for point of intersection.
+ * @param normal             Output parameter for surface normal.
+ * @param outside            Output param for whether the ray came from outside.
+ * @return                   Ray parameter `t` value. -1 if no intersection.
+ */
+__host__ __device__ float triangleIntersectionTest(
+    Geom triangle,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside);
+
 /**
  * Test intersection between a ray and one of the procedural signed distance
- * field shapes (MANDELBULB, MENGER). Unlike the primitives above there is no
- * closed form for the hit, so the ray is marched with sphere tracing: the SDF
- * gives a lower bound on the distance to the surface, so a step of that size can
- * never tunnel through it.
+ * field shapes (MANDELBULB, MENGER). There is no closed form, so the ray is
+ * marched with sphere tracing: the SDF lower bounds the distance to the surface,
+ * so a step of that size can never tunnel through it. The march runs in world
+ * space but evaluates the SDF in object space, so the step is divided by the
+ * object's largest scale - scaling a Lipschitz-1 field by s makes it Lipschitz-s.
  *
- * The march runs in world space but evaluates the SDF in object space, so the
- * step is divided by the object's largest scale factor - scaling a Lipschitz-1
- * field by s turns it into a Lipschitz-s field, and without that division a
- * scaled up object would be stepped straight through.
- *
- * @param stepCounter  Optional instrumentation: adds the number of marching
- *                     steps this call used (may be NULL).
+ * @param stepCounter  Optional instrumentation: marching steps used (may be NULL).
  * @param histogram    Optional instrumentation: 16 buckets of 8 steps, as 64 bit
- *                     counters because a long render overflows 32 of them (may be
- *                     NULL).
+ *                     counters because a long render overflows 32 of them.
  * @return             Ray parameter `t` value. -1 if no intersection.
  */
 __host__ __device__ float sdfIntersectionTest(
@@ -108,8 +121,37 @@ __host__ __device__ float sdfIntersectionTest(
     unsigned long long* stepCounter,
     unsigned long long* histogram);
 
-/**
- * Evaluate the signed distance field of `geom` at an object space point. Units:
- * object space, i.e. distance to the surface in the untransformed shape.
- */
+/** Signed distance of `geom`'s field at an object space point. */
 __host__ __device__ float sdfEvaluate(int geomType, glm::vec3 p);
+
+/** Intersect one geometry, whatever kind it is. The main ray and the shadow ray
+ *  both go through here, so a new primitive cannot reach one and miss the other.
+ *  `stepCounter` / `histogram` are the SDF instrumentation and may be NULL. */
+__host__ __device__ inline float intersectGeom(
+    const Geom& geom,
+    Ray r,
+    glm::vec3& intersectionPoint,
+    glm::vec3& normal,
+    bool& outside,
+    unsigned long long* stepCounter = NULL,
+    unsigned long long* histogram = NULL)
+{
+    if (geom.type == CUBE)
+    {
+        return boxIntersectionTest(geom, r, intersectionPoint, normal, outside);
+    }
+    if (geom.type == SPHERE)
+    {
+        return sphereIntersectionTest(geom, r, intersectionPoint, normal, outside);
+    }
+    if (geom.type == TRIANGLE)
+    {
+        return triangleIntersectionTest(geom, r, intersectionPoint, normal, outside);
+    }
+    return sdfIntersectionTest(geom, r, intersectionPoint, normal, outside, stepCounter, histogram);
+}
+
+/** World space axis aligned bounds of a geometry, for the acceleration structure
+ *  and for the light list. Conservative for the shapes that have no closed form:
+ *  an SDF is bounded by the ball that already clips it. */
+__host__ void geomWorldBounds(const Geom& geom, glm::vec3& boundsMin, glm::vec3& boundsMax);
