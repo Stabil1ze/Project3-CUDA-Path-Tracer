@@ -1,0 +1,287 @@
+{
+    "Materials": {
+        "light": {
+            "TYPE": "Emitting",
+            "RGB": [
+                1.0,
+                0.96,
+                0.9
+            ],
+            "EMITTANCE": 14.0
+        },
+        "floor": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.62,
+                0.6,
+                0.57
+            ]
+        },
+        "ceiling": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.88,
+                0.88,
+                0.88
+            ]
+        },
+        "wall_left": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.16,
+                0.42,
+                0.52
+            ]
+        },
+        "wall_right": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.72,
+                0.36,
+                0.16
+            ]
+        },
+        "wall_back": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.82,
+                0.8,
+                0.78
+            ]
+        },
+        "diffuse": {
+            "TYPE": "Diffuse",
+            "RGB": [
+                0.78,
+                0.76,
+                0.72
+            ]
+        },
+        "mirror": {
+            "TYPE": "Specular",
+            "RGB": [
+                0.95,
+                0.95,
+                0.95
+            ],
+            "ROUGHNESS": 0.0
+        },
+        "rough_copper": {
+            "TYPE": "Specular",
+            "RGB": [
+                0.95,
+                0.64,
+                0.54
+            ],
+            "ROUGHNESS": 0.25
+        },
+        "glass": {
+            "TYPE": "Refractive",
+            "RGB": [
+                0.98,
+                0.98,
+                0.98
+            ],
+            "IOR": 1.5
+        }
+    },
+    "Objects": [
+        {
+            "TYPE": "cube",
+            "MATERIAL": "light",
+            "TRANS": [
+                0.0,
+                10.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                3.0,
+                0.3,
+                3.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "floor",
+            "TRANS": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                24.0,
+                0.01,
+                24.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "ceiling",
+            "TRANS": [
+                0.0,
+                10.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                90.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "wall_back",
+            "TRANS": [
+                0.0,
+                5.0,
+                -5.0
+            ],
+            "ROTAT": [
+                0.0,
+                90.0,
+                0.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "wall_left",
+            "TRANS": [
+                -5.0,
+                5.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "cube",
+            "MATERIAL": "wall_right",
+            "TRANS": [
+                5.0,
+                5.0,
+                0.0
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                0.01,
+                10.0,
+                10.0
+            ]
+        },
+        {
+            "TYPE": "sphere",
+            "MATERIAL": "diffuse",
+            "TRANS": [
+                -3.1,
+                1.5,
+                0.2
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                3.0,
+                3.0,
+                3.0
+            ]
+        },
+        {
+            "TYPE": "sphere",
+            "MATERIAL": "mirror",
+            "TRANS": [
+                0.0,
+                1.5,
+                -1.4
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                3.0,
+                3.0,
+                3.0
+            ]
+        },
+        {
+            "TYPE": "sphere",
+            "MATERIAL": "rough_copper",
+            "TRANS": [
+                3.1,
+                1.5,
+                0.2
+            ],
+            "ROTAT": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "SCALE": [
+                3.0,
+                3.0,
+                3.0
+            ]
+        }
+    ],
+    "Camera": {
+        "RES": [
+            800,
+            600
+        ],
+        "FOVY": 45.0,
+        "ITERATIONS": 1200,
+        "DEPTH": 8,
+        "FILE": "materials",
+        "CHECKPOINT": 30.0,
+        "EYE": [
+            0.0,
+            2.7,
+            8.6
+        ],
+        "LOOKAT": [
+            0.0,
+            1.5,
+            -0.5
+        ],
+        "UP": [
+            0.0,
+            1.0,
+            0.0
+        ]
+    }
+}
