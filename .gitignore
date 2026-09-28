@@ -557,3 +557,6 @@ xcuserdata
 *.xccheckout
 *.moved-aside
 *.xcuserstate
+
+# Open Image Denoise prebuilt package (see the README: download it, do not commit it)
+external/oidn-*/

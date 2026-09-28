@@ -1,4 +1,5 @@
 #include "glslUtility.hpp"
+#include "denoise.h"
 #include "image.h"
 #include "pathtrace.h"
 #include "scene.h"
@@ -37,6 +38,7 @@ static bool camchanged = true;
 static float dtheta = 0, dphi = 0;
 // Restartable rendering: glfwGetTime() of the last checkpoint write.
 static double lastCheckpointTime = 0.0;
+static double lastFrameTime = 0.0;
 static glm::vec3 cammove;
 
 float zoom, theta, phi;
@@ -368,13 +370,10 @@ int main(int argc, char** argv)
     cameraPosition = cam.position;
 
     // The interactive camera is an orbit camera: runCuda() places the eye at
-    //
-    //   lookAt + zoom * (sin(phi) * sin(theta), cos(theta), cos(phi) * sin(theta))
-    //
-    // so the two angles and the distance have to be recovered from the
-    // eye/look-at pair of the scene file by inverting exactly that expression.
-    // Recovering theta from |view.y| instead of view.y silently mirrors the
-    // camera vertically whenever the scene looks downwards.
+    // lookAt + zoom * (sin(phi)*sin(theta), cos(theta), cos(phi)*sin(theta)), so
+    // the angles and the distance have to be recovered by inverting exactly that
+    // expression. Recovering theta from |view.y| instead of view.y would mirror
+    // the camera vertically whenever the scene looks downwards.
     ogLookAt = cam.lookAt;
     glm::vec3 eyeOffset = cam.position - ogLookAt;
     zoom = glm::length(eyeOffset);
@@ -423,6 +422,44 @@ void saveImage()
     // CHECKITOUT
     img.savePNG(filename);
     //img.saveHDR(filename);  // Save a Radiance HDR file
+
+    // Denoise the same buffer and save it next to the raw one, so the two can be
+    // compared directly. The input is the linear mean radiance (not the clamped
+    // 8 bit image), and the guides are the first hit's normal and albedo.
+    if (denoiserAvailable())
+    {
+        const int pixelcount = width * height;
+        std::vector<glm::vec3> linear(pixelcount);
+        for (int i = 0; i < pixelcount; i++)
+        {
+            linear[i] = renderState->image[i] / samples;
+        }
+        pathtraceFetchDenoiseGuides(scene);
+
+        std::vector<glm::vec3> denoised;
+        const DenoiseResult result = denoiseImage(linear, renderState->normalImage,
+            renderState->albedoImage, width, height, denoised);
+        if (result.ok)
+        {
+            Image denoisedImage(width, height);
+            for (int x = 0; x < width; x++)
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    denoisedImage.setPixel(width - 1 - x, y, glm::vec3(denoised[x + y * width]));
+                }
+            }
+            // savePNG appends ".png" itself.
+            const std::string denoisedName = filename + ".denoised";
+            denoisedImage.savePNG(denoisedName);
+            printf("[oidn] \"%s\" denoised in %.0f ms on \"%s\" (normal + albedo guides)\n",
+                denoisedName.c_str(), result.milliseconds, result.device.c_str());
+        }
+        else
+        {
+            printf("[oidn] denoising skipped: %s\n", result.message.c_str());
+        }
+    }
 }
 
 void runCuda()
@@ -473,6 +510,12 @@ void runCuda()
                 renderState->imageName.c_str(), renderState->checkpointInterval);
         }
         lastCheckpointTime = glfwGetTime();
+        lastFrameTime = glfwGetTime();
+        if (renderState->frameInterval > 0.0f)
+        {
+            printf("[frames] writing one image every %.1f s; the file name carries the sample "
+                "count it had reached\n", renderState->frameInterval);
+        }
     }
 
     if (iteration < renderState->iterations)
@@ -488,10 +531,9 @@ void runCuda()
         // unmap buffer object
         cudaGLUnmapBufferObject(pbo);
 
-        // Restartable rendering: write the accumulation buffer out every
-        // checkpointInterval seconds so that a render that takes hours survives
-        // a reboot (or the user pressing Ctrl-C). The interval is a scene field
-        // because it is really an I/O budget: 0 turns it off entirely.
+        // Restartable rendering: save every checkpointInterval seconds, so a
+        // render that takes hours survives a reboot. It is a scene field because
+        // it is really an I/O budget: 0 turns it off entirely.
         const float interval = renderState->checkpointInterval;
         if (interval > 0.0f && iteration < renderState->iterations)
         {
@@ -503,6 +545,21 @@ void runCuda()
                     printf("[checkpoint] saved at %d samples\n", iteration);
                 }
                 lastCheckpointTime = now;
+            }
+        }
+
+        // Write-out frames: the same idea, but as an image, so an animation can
+        // show what the renderer had after a given wall clock time. The name
+        // carries the sample count - two renderers at the same moment have very
+        // different counts, and that difference is the speed difference.
+        const float frameInterval = renderState->frameInterval;
+        if (frameInterval > 0.0f)
+        {
+            const double now = glfwGetTime();
+            if (now - lastFrameTime >= frameInterval)
+            {
+                saveImage();
+                lastFrameTime = now;
             }
         }
     }
