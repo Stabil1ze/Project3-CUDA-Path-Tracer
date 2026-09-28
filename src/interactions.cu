@@ -53,12 +53,9 @@ __host__ __device__ glm::vec3 calculateRandomDirectionInHemisphere(
         + sin(around) * over * perpendicularDirection2;
 }
 
-// Dielectric radiance scaling: a transmitted ray that enters a denser medium
-// carries radiance scaled by (etaI / etaT)^2 (PBRT v3 8.2.3). It matters for any
-// path that ends inside the medium - a path that enters and leaves again gets the
-// factor and its inverse, but one that is terminated inside (depth budget or
-// Russian roulette) does not, and glass balls terminate a lot of paths inside.
-// Set to 0 to see the difference.
+// Dielectric radiance scaling
+// 1 (default): scale the radiance by the Fresnel reflectance for refraction rays
+// 0: no scaling
 #ifndef REFRACTION_RADIANCE_SCALING
 #define REFRACTION_RADIANCE_SCALING 1
 #endif
@@ -71,32 +68,21 @@ __host__ __device__ void scatterRay(
     const Material &m,
     thrust::default_random_engine &rng)
 {
-    // Keep the normal on the side the ray came from. The intersection tests
-    // already flip it when the ray starts inside a primitive, but a surface
-    // can still be hit while the normal points "away" (e.g. grazing hits on a
-    // transformed box), which would send the diffuse ray into the object.
+    // Keep the normal on the side the ray came from
     if (glm::dot(normal, pathSegment.ray.direction) > 0.0f)
     {
         normal = -normal;
     }
-    // Geometric normal (pointing outward) recovered from the flag: the
-    // intersection tests return the normal oriented against the incoming ray, so
-    // for a hit from the inside it comes back negated. Refraction swaps the
-    // indices of refraction by direction, not by which way the normal happens to
-    // point, so keep the outward one around for the ray origin nudge below.
+    // Geometric normal recovered from the flag
     const glm::vec3 outwardNormal = entering ? normal : -normal;
 
-    // The BSDF lives in bsdf.h as the three part Sample / Eval / Pdf interface.
-    // A path only calls the sampler; the other two are for the estimator in
-    // pathtrace.cu, which evaluates the BSDF at a direction it did not sample.
+	// Get sampled direction and weight from the BSDF
     const glm::vec3 incident = glm::normalize(pathSegment.ray.direction);
     const BsdfSample sample = bsdfSample(m, normal, entering, incident, rng);
 
+	// End if the BSDF returned a zero weight or a zero PDF
     if (!sample.specular && !(sample.pdf > 0.0f))
     {
-        // A degenerate sample: a half vector below the horizon, or a lobe that
-        // spiked to a delta. It has no energy and no density to divide by, so the
-        // path ends here (the same convention the inline version used).
         pathSegment.color = glm::vec3(0.0f);
         pathSegment.remainingBounces = -1;
         return;
@@ -104,16 +90,9 @@ __host__ __device__ void scatterRay(
 
     pathSegment.ray.direction = glm::normalize(sample.direction);
     pathSegment.color *= sample.weight;
-    // How likely this direction was, for the MIS weight of a light the segment
-    // may land on (see PathSegment::lastPdf). A delta sample reports 0.
     pathSegment.lastPdf = sample.specular ? 0.0f : sample.pdf;
 
-    // Spawn the next ray from the hit point, nudged off the surface. Without
-    // this the new ray can immediately re-intersect the surface it left
-    // (shadow acne) because of floating point error in `t`. The nudge has to go
-    // to the side the *new* ray leaves on: a transmitted ray goes into the
-    // medium, so pushing it back out along the incident side would trap it
-    // inside the surface.
+    // Spawn the next ray from the hit point
     glm::vec3 offsetNormal = outwardNormal;
     if (glm::dot(offsetNormal, pathSegment.ray.direction) < 0.0f)
     {
@@ -126,10 +105,6 @@ __host__ __device__ void scatterRay(
 // ---------------------------------------------------------------------------
 // Procedural textures
 // ---------------------------------------------------------------------------
-// Both textures are pure functions of the object space hit point, which is what
-// makes them procedural: no files, no texture memory, no UVs, and the same code
-// works on any shape - including the SDF fractals, whose UV layout would be a
-// nightmare to define.
 
 __host__ __device__ inline float hashToUnitFloat(unsigned int x)
 {
@@ -187,16 +162,13 @@ __host__ __device__ glm::vec3 evaluateProceduralTexture(int textureType, glm::ve
 {
     if (textureType == 1)
     {
-        // Checker board: the parity of the lattice cell the point falls in. The
-        // albedo is multiplied by either 1 or a dark value, so a coloured
-        // material keeps its colour but gains dark squares.
+		// Check if the sum of the floored coordinates is even or odd to determine the color of the cell
         float cells = glm::floor(p.x) + glm::floor(p.y) + glm::floor(p.z);
         float parity = glm::mod(cells, 2.0f);
         return glm::mix(glm::vec3(1.0f), glm::vec3(0.08f, 0.08f, 0.10f), parity);
     }
 
-    // Marble: veins along a diagonal, distorted by fractal noise. sin^2 keeps the
-    // result in [0, 1] so the multiplier never brightens the albedo.
+	// Veins along a diagonal, distorted by fractal noise for a marble-like effect
     float veins = fractalNoise(p);
     float bands = sinf((p.x + p.y * 0.6f + p.z * 0.35f) * 3.0f + veins * 6.0f);
     bands = bands * bands;

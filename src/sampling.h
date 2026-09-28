@@ -2,43 +2,22 @@
 
 // Low-discrepancy sampling for the Monte Carlo integrals in the path tracer.
 //
-// The renderer used to draw every random number from a hash seeded linear
-// congruential generator (thrust::default_random_engine), which is fine but has
-// the usual 1/sqrt(N) convergence of pure random sampling and, worse, happily
-// clumps: two consecutive samples can land on top of each other. This file
-// replaces the draws with a **scrambled Halton sequence**: dimension d of sample
-// i of pixel p is
-//
-//     x = fract(Phi_{b_d}(i) + offset(p, d))
-//
-// where Phi_{b_d} is the radical inverse in the d-th prime base and the offset is
-// a Cranley-Patterson rotation hashed from the pixel and the dimension. Each
-// dimension therefore has its own base *and* its own rotation, which is what
-// decorrelates both the pixels and the dimensions of one path.
-//
-// Two ways of getting this wrong, both measured rather than guessed at:
-//
-//  * Giving every dimension the *same* base with only an XOR of the index (the
-//    cheap "Sobol-like" shortcut) makes the coordinates of a 2D sample lie on a
-//    constant diagonal - each coordinate is stratified on its own, but the pair
-//    is not, and the anti-aliasing got six times worse (silhouette RMSE 11.8
-//    against 2.2 for the random sampler it was supposed to beat).
-//  * Giving two *bounces* the same dimensions makes every bounce of a path draw
-//    the same values, which correlates them and darkens the image by 2%.
-//    pathtrace.cu therefore gives each bounce a block of eight dimensions.
-//
-// Why it helps: the error of a Monte Carlo estimate is driven by how evenly the
-// samples cover the domain. Stratified and low-discrepancy sequences put the
-// sample points down and then *keep them apart*, so a fixed budget of samples
-// covers pixel area, lens disk and BSDF lobe more evenly than random draws. The
-// measurement is in the README (same sample count, same scenes, lower error).
+// Dimension d of sample i of pixel p is fract(Phi_{b_d}(i) + offset(p, d)): the
+// radical inverse in the d-th prime base, rotated by a Cranley-Patterson offset
+// hashed from the pixel and the dimension. Each dimension has its own base *and*
+// its own rotation, which decorrelates the pixels and the dimensions of a path.
+// Both ways of getting this wrong were measured, not guessed: sharing one base
+// across dimensions puts a 2D sample on a constant diagonal (silhouette RMSE
+// 11.8 against 2.2 for the random sampler it was meant to beat), and sharing
+// dimensions across bounces darkens the image by 2%.
 
 #include <glm/glm.hpp>
 #include <thrust/random.h>
 
-// Toggle for the whole feature: 1 uses the scrambled Halton sequence, 0 falls
-// back to the hash seeded LCG that the renderer used before, so the improvement
-// can be measured with a one line change.
+// Whole feature toggle
+// 1 (default): scrambled Halton sequence
+// 0: the hash seeded LCG the renderer used before, so the improvement is
+//    measurable with a one line change
 #ifndef LOW_DISCREPANCY_SAMPLING
 #define LOW_DISCREPANCY_SAMPLING 1
 #endif
@@ -70,19 +49,10 @@ __host__ __device__ inline float radicalInverse(int base, unsigned int index)
     return result;
 }
 
-/**
- * The sample stream of one path. It is created from (iteration, pixel) and hands
- * out one low-discrepancy value per dimension, so every sample of every pixel
- * walks the same sequence with its own rotation. Nothing here is stateful across
- * iterations, which is what keeps a checkpointed render resumable: sample i of
- * pixel p is the same number whether it is drawn now or after a restart.
- */
-/**
- * One prime per path dimension (64 of them, so a path with eight bounces of
- * eight dimensions still never reuses a base). Beyond the table the bases wrap,
- * which is the standard compromise; the rotation still distinguishes them.
- * A file scope array would not be visible in device code, hence the function.
- */
+/** Prime base of one path dimension (64 of them, so eight bounces of eight
+ *  dimensions still never reuse one). Beyond the table the bases wrap, which is
+ *  the standard compromise; the rotation still distinguishes them. A file scope
+ *  array would not be visible in device code, hence the function. */
 __host__ __device__ inline int samplingBase(unsigned int dimension)
 {
     const int bases[64] = {
@@ -95,6 +65,10 @@ __host__ __device__ inline int samplingBase(unsigned int dimension)
     return bases[dimension % 64u];
 }
 
+/** The sample stream of one path: created from (iteration, pixel), it hands out
+ *  one low-discrepancy value per dimension. Nothing here is stateful across
+ *  iterations, which is what keeps a checkpointed render resumable - sample i of
+ *  pixel p is the same number whether it is drawn now or after a restart. */
 struct Sampler
 {
     unsigned int iteration;
@@ -130,11 +104,8 @@ struct Sampler
     }
 };
 
-/**
- * The one place that decides where a random number comes from: the low
- * discrepancy sequence, or the generator the renderer used before (kept so the
- * two can be compared). Everything that needs a random number goes through it.
- */
+/** The one place that decides where a random number comes from: the low
+ *  discrepancy sequence, or the generator used before (kept for comparison). */
 __host__ __device__ inline float nextRandom(thrust::default_random_engine& rng, Sampler& sampler)
 {
 #if LOW_DISCREPANCY_SAMPLING

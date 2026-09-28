@@ -1,31 +1,18 @@
 #pragma once
 
 // GGX / Trowbridge-Reitz microfacet utilities for the glossy specular lobe.
-//
-// The functions are written from the published formulas rather than ported from
-// another renderer (my CG2025 HW7 used an Embree side project's ggx_utils.hpp,
-// which is third party code and explicitly not reused here):
-//
-//  * D, the GGX normal distribution, and the Smith masking-shadowing function
-//    (height correlated form) - PBRT v3 8.4.2, Walter et al. 2007.
-//  * Fresnel via Schlick's approximation with a spectral F0 - PBRT v3 8.2.2.
-//  * Importance sampling of the *visible* normal distribution - Heitz, "Sampling
-//    the GGX Distribution of Visible Normals", JCGT 2018. The visible variant is
-//    what keeps grazing angles from wasting samples (see GLOSSY_VNDF_SAMPLING in
-//    interactions.cu for the comparison against the classic NDF-only formula).
-//
-// Everything works in the hemisphere around +Z in a local frame and is lifted
-// into world space by the basis helpers at the bottom.
+// Written from the published formulas, not ported from another renderer:
+//   D and the height correlated Smith masking - PBRT v3 8.4.2, Walter et al. 2007
+//   Fresnel via Schlick with a spectral F0 - PBRT v3 8.2.2
+//   visible normal importance sampling - Heitz, JCGT 2018
+// Everything works in the hemisphere around +Z of a local frame.
 
 #include <glm/glm.hpp>
 
 #include "utilities.h"   // TWO_PI
 
-/**
- * Alpha from the artist facing roughness. Squaring is the Disney/PBRT
- * convention: perceptual roughness, so that a slider in the middle of its range
- * looks like a surface in the middle of glossy and matte.
- */
+/** Alpha from the artist facing roughness. Squaring is the Disney/PBRT
+ *  convention, so a slider in the middle of its range looks mid-glossy. */
 __host__ __device__ inline float ggxAlphaFromRoughness(float roughness)
 {
     float r = glm::clamp(roughness, 0.0f, 1.0f);
@@ -58,12 +45,9 @@ __host__ __device__ inline float ggxG1(float cosTheta, float alpha)
     return 1.0f / (1.0f + ggxLambda(cosTheta, alpha));
 }
 
-/**
- * Height correlated Smith G2 (Heitz 2014): cheaper than the separable product
- * and it does not darken surfaces at grazing angles, which is what makes a rough
- * metal look like metal instead of like a rough metal that has been dipped in
- * soot. cosThetaV / cosThetaL are the cosines of the view and light directions.
- */
+/** Height correlated Smith G2 (Heitz 2014): cheaper than the separable product
+ *  and it does not darken grazing angles, which keeps rough metal from looking
+ *  like metal dipped in soot. */
 __host__ __device__ inline float ggxG2HeightCorrelated(float cosThetaV, float cosThetaL, float alpha)
 {
     float lv = ggxLambda(cosThetaV, alpha);
@@ -92,13 +76,8 @@ __host__ __device__ inline void buildTangentFrame(glm::vec3 n, glm::vec3& t1, gl
     t2 = glm::cross(n, t1);
 }
 
-/**
- * Sample a half vector from the distribution of *visible* normals (Heitz 2018).
- * `wo` is the direction the ray came from (pointing away from the surface),
- * `alpha` the GGX roughness, u1/u2 two uniform random numbers. Implementation is
- * the standard stretched-vector form: transform into the local frame, stretch wo
- * by alpha, sample the unit disk, and lift the result back.
- */
+/** Sample a half vector from the distribution of *visible* normals (Heitz 2018),
+ *  in the standard stretched-vector form. `wo` points away from the surface. */
 __host__ __device__ inline glm::vec3 ggxSampleVisibleNormal(glm::vec3 n, glm::vec3 wo, float alpha,
     float u1, float u2)
 {
@@ -127,12 +106,8 @@ __host__ __device__ inline glm::vec3 ggxSampleVisibleNormal(glm::vec3 n, glm::ve
     return t1 * ne.x + t2 * ne.y + n * ne.z;
 }
 
-/**
- * The classic (non visible) NDF sampling: cos(theta) = sqrt((1-u)/(1+(a^2-1)u)).
- * Kept for the comparison in the README - at grazing angles it samples half
- * vectors that point below the surface, and every one of those samples is
- * wasted (or silently loses energy if it is dropped).
- */
+/** The classic (non visible) NDF sampling, kept for the README comparison: at
+ *  grazing angles it samples half vectors below the surface, which are wasted. */
 __host__ __device__ inline glm::vec3 ggxSampleNormal(glm::vec3 n, float alpha, float u1, float u2)
 {
     float a2 = alpha * alpha;
