@@ -919,6 +919,17 @@ static unsigned long long checkpointSceneHash(const Scene* scene)
     hash = hashCheckpointBytes(hash, &cam.focalDistance, sizeof(float));
     hash = hashCheckpointBytes(hash, &cam.resolution, sizeof(glm::ivec2));
     hash = hashCheckpointBytes(hash, &state.traceDepth, sizeof(int));
+    // Scene level lights: the sky and the sun change the image without touching
+    // a material, so they have to be part of the fingerprint
+    hash = hashCheckpointBytes(hash, &state.environment.zenith, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &state.environment.horizon, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &state.environment.ground, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &state.environment.intensity, sizeof(float));
+    hash = hashCheckpointBytes(hash, &state.distantLight.direction, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &state.distantLight.radiance, sizeof(glm::vec3));
+    hash = hashCheckpointBytes(hash, &state.distantLight.cosMaxAngle, sizeof(float));
+    hash = hashCheckpointBytes(hash, &state.distantLight.solidAngle, sizeof(float));
+    hash = hashCheckpointBytes(hash, &state.distantLight.enabled, sizeof(int));
 
     for (const Material& m : scene->materials)
     {
@@ -940,6 +951,17 @@ static unsigned long long checkpointSceneHash(const Scene* scene)
         hash = hashCheckpointBytes(hash, &g.rotation, sizeof(glm::vec3));
         hash = hashCheckpointBytes(hash, &g.scale, sizeof(glm::vec3));
         hash = hashCheckpointBytes(hash, &g.transform, sizeof(glm::mat4));
+        // Mesh triangles: replacing an .obj with one that has the same triangle
+        // count leaves every field above unchanged
+        if (g.type == TRIANGLE)
+        {
+            hash = hashCheckpointBytes(hash, &g.v0, sizeof(glm::vec3));
+            hash = hashCheckpointBytes(hash, &g.v1, sizeof(glm::vec3));
+            hash = hashCheckpointBytes(hash, &g.v2, sizeof(glm::vec3));
+            hash = hashCheckpointBytes(hash, &g.n0, sizeof(glm::vec3));
+            hash = hashCheckpointBytes(hash, &g.n1, sizeof(glm::vec3));
+            hash = hashCheckpointBytes(hash, &g.n2, sizeof(glm::vec3));
+        }
     }
     return hash;
 }
