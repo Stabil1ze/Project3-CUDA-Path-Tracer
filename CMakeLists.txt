@@ -78,6 +78,7 @@ set(sources
     src/interactions.cu
     src/mesh.cpp
     src/scene.cpp
+    src/stats.cu
     src/utilities.cpp
 )
 

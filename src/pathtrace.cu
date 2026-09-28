@@ -16,6 +16,7 @@
 #include "bvh.h"
 #include "lights.h"
 #include "checkpoint.h"
+#include "stats.h"
 #include "glm/glm.hpp"
 #include "glm/gtx/norm.hpp"
 #include "utilities.h"
@@ -56,12 +57,6 @@
 // Below this many primitives the flat loop is faster than a traversal
 #define BVH_MIN_PRIMITIVES 24
 
-// Procedural shape instrumentation: sphere tracing steps into a global counter
-// plus a 16 bucket histogram, printed at the end of the render
-// 1 (default): on
-// 0: off (the atomics cost a few percent, so off when timing)
-#define SDF_STATS 1
-
 // Russian roulette: kill unimportant paths early without biasing the estimator
 // 1 (default): from RR_MIN_DEPTH segments on, survive with p = throughput and
 //              divide the survivors by p
@@ -74,11 +69,6 @@
 // 1 (default): on
 // 0: off - the "before" side of the measurement
 #define DIRECT_LIGHT_SAMPLING 1
-
-// Sample ledger for the estimator above
-// 1 (default): on (a few atomics per sample, so off when timing)
-// 0: off
-#define DIRECT_LIGHT_STATS 1
 
 // Skip the sampled light in its own shadow test
 // 1 (default): skip it
@@ -179,90 +169,10 @@ static glm::vec3* dev_firstNormal = NULL;
 static glm::vec3* dev_firstAlbedo = NULL;
 
 // Per-bounce ray counts for analysis
-static const int MAX_PROFILE_DEPTH = 64;
-static long long h_bounceAlive[MAX_PROFILE_DEPTH];
-static long long h_profileIters = 0;
 
-// GPU timer
-struct StageTimer
-{
-    cudaEvent_t events[2][2];
-    int slot = 0;
-    int recorded = 0;
-    int samples = 0;
-    double totalMs = 0.0;
-    bool created = false;
 
-    void init()
-    {
-        for (int s = 0; s < 2; s++)
-        {
-            cudaEventCreate(&events[s][0]);
-            cudaEventCreate(&events[s][1]);
-        }
-        slot = 0;
-        recorded = 0;
-        samples = 0;
-        totalMs = 0.0;
-        created = true;
-    }
 
-    void destroy()
-    {
-        if (!created) { return; }
-        for (int s = 0; s < 2; s++)
-        {
-            cudaEventDestroy(events[s][0]);
-            cudaEventDestroy(events[s][1]);
-        }
-        created = false;
-    }
 
-    void begin()
-    {
-        cudaEventRecord(events[slot][0]);
-    }
-
-    void end()
-    {
-        cudaEventRecord(events[slot][1]);
-        slot = 1 - slot;        // the other pair holds the previous iteration
-        recorded++;
-        if (recorded < 2) { return; }
-        if (cudaEventQuery(events[slot][1]) == cudaSuccess)
-        {
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, events[slot][0], events[slot][1]);
-            totalMs += ms;
-            samples++;
-        }
-    }
-
-    double averageMs() const
-    {
-        return samples > 0 ? totalMs / samples : 0.0;
-    }
-};
-
-static StageTimer stageTrace, stageSort, stageShade;
-
-// SDF instrumentation
-static const int SDF_HISTOGRAM_BUCKETS = 16;
-static const int SDF_STEPS_PER_BUCKET = 8;
-static unsigned long long* dev_sdfSteps = NULL;
-static unsigned long long* dev_sdfHistogram = NULL;
-static unsigned long long h_sdfSteps = 0;
-static unsigned long long h_sdfHistogram[SDF_HISTOGRAM_BUCKETS];
-
-// Russian roulette instrumentation
-static unsigned long long* dev_rrDecisions = NULL;
-static unsigned long long* dev_rrKills = NULL;
-
-// Summed in fixed point
-static unsigned long long* dev_rrSurvivalMilli = NULL;
-static unsigned long long h_rrDecisions = 0;
-static unsigned long long h_rrKills = 0;
-static unsigned long long h_rrSurvivalMilli = 0;
 
 // Direct lighting instrumentation
 
@@ -272,28 +182,6 @@ static int h_lightCount = 0;
 static float h_totalLightArea = 0.0f;
 
 
-
-static LightLedger* dev_lightLedger = NULL;       // one row per light
-static LightLedger* dev_lightFaceLedger = NULL;   // one row per light and face
-static LightLedger* dev_foldedLedger = NULL;      // the BSDF hits the estimator replaced
-static LightLedger* dev_foldedAboveLedger = NULL;  
-static LightLedger* dev_foldedFaceLedger = NULL;   // [face + 6 * fromAbove], diagnostics
-
-static void addLedger(LightLedger& into, const LightLedger& from)
-{
-    into.samples += from.samples;
-    into.accepted += from.accepted;
-    into.rejectCosSurface += from.rejectCosSurface;
-    into.rejectCosLight += from.rejectCosLight;
-    into.occluded += from.occluded;
-    into.acceptedEnergy += from.acceptedEnergy;
-    into.acceptedEnergySq += from.acceptedEnergySq;
-    into.nonFiniteEnergy += from.nonFiniteEnergy;
-    into.bsdfHits += from.bsdfHits;
-    into.bsdfEnergy += from.bsdfEnergy;
-    into.bsdfEnergyPlain += from.bsdfEnergyPlain;
-    into.bsdfEnergySq += from.bsdfEnergySq;
-}
 
 
 static int nextPowerOfTwoAtLeast(int n)
@@ -305,242 +193,6 @@ static int nextPowerOfTwoAtLeast(int n)
     }
     return m;
 }
-
-static void printBounceProfile(const char* tag, const long long* counts, int segments, long long divisor, int pixelcount)
-{
-    if (divisor <= 0)
-    {
-        return;
-    }
-
-    printf("[profile] %s", tag);
-    for (int i = 0; i < segments && i < MAX_PROFILE_DEPTH; i++)
-    {
-        long long alive = counts[i] / divisor;
-        printf(" b%d=%lld(%.1f%%)", i + 1, alive,
-            100.0 * (double)alive / (double)pixelcount);
-    }
-    printf("\n");
-}
-
-// Where the time went, as GPU milliseconds per bounce (see StageTimer)
-static void printStageTimings()
-{
-    const double trace = stageTrace.averageMs();
-    const double sort = stageSort.averageMs();
-    const double shade = stageShade.averageMs();
-    if (trace <= 0.0 && sort <= 0.0 && shade <= 0.0)
-    {
-        return;
-    }
-    printf("[stage] per bounce: intersections %.2f ms, material sort %.2f ms, shading %.2f ms "
-        "(%d bounces averaged)\n", trace, sort, shade, stageShade.samples);
-}
-
-// README instrumentation for the procedural shapes
-static void printSdfStats(int pixelcount)
-{
-#if SDF_STATS
-    if (dev_sdfSteps == NULL)
-    {
-        return;
-    }
-    cudaMemcpy(&h_sdfSteps, dev_sdfSteps, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sdfHistogram, dev_sdfHistogram,
-        SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-
-    unsigned long long tests = 0;
-    for (int i = 0; i < SDF_HISTOGRAM_BUCKETS; i++)
-    {
-        tests += h_sdfHistogram[i];
-    }
-    if (tests == 0)
-    {
-        return;
-    }
-
-    printf("[sdf] sphere tracing: %u marches, %.1f steps per march, %.2f steps per camera ray",
-        (unsigned int)tests, (double)h_sdfSteps / (double)tests,
-        (double)h_sdfSteps / (double)pixelcount);
-    printf("\n[sdf] steps per march histogram (bucket width %d):", SDF_STEPS_PER_BUCKET);
-    for (int i = 0; i < SDF_HISTOGRAM_BUCKETS; i++)
-    {
-        if (h_sdfHistogram[i] == 0)
-        {
-            continue;
-        }
-        printf(" %d-%d:%llu", i * SDF_STEPS_PER_BUCKET,
-            (i + 1) * SDF_STEPS_PER_BUCKET - 1, h_sdfHistogram[i]);
-    }
-    printf("\n");
-#endif
-}
-
-// README instrumentation for Russian roulette
-static void printRussianRouletteStats(int pixelcount)
-{
-#if RUSSIAN_ROULETTE
-    if (dev_rrDecisions == NULL)
-    {
-        return;
-    }
-    cudaMemcpy(&h_rrDecisions, dev_rrDecisions, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_rrKills, dev_rrKills, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&h_rrSurvivalMilli, dev_rrSurvivalMilli, sizeof(unsigned long long),
-        cudaMemcpyDeviceToHost);
-    if (h_rrDecisions == 0)
-    {
-        return;
-    }
-
-    printf("[rr] %llu roulette decisions (%.2f per camera ray), %llu killed (%.1f%%), "
-        "mean survival probability %.3f\n",
-        h_rrDecisions, (double)h_rrDecisions / (double)pixelcount,
-        h_rrKills, 100.0 * (double)h_rrKills / (double)h_rrDecisions,
-        (double)h_rrSurvivalMilli / (1000.0 * (double)h_rrDecisions));
-#else
-    (void)pixelcount;
-#endif
-}
-
-// README instrumentation for direct lighting
-static const char* lightFaceName(int face)
-{
-    switch (face)
-    {
-        case 0: return "-z";
-        case 1: return "+z";
-        case 2: return "-y";
-        case 3: return "+y";
-        case 4: return "-x";
-        default: return "+x";
-    }
-}
-
-static void printDirectLightStats(int pixelcount)
-{
-#if DIRECT_LIGHT_SAMPLING && DIRECT_LIGHT_STATS
-    if (dev_lightLedger == NULL)
-    {
-        return;
-    }
-
-    std::vector<LightLedger> perLight(h_lightCount + 1);
-    std::vector<LightLedger> perFace((size_t)glm::max(h_lightCount, 1) * LIGHT_SAMPLE_FACES);
-    LightLedger folded;
-    cudaMemcpy(perLight.data(), dev_lightLedger, perLight.size() * sizeof(LightLedger),
-        cudaMemcpyDeviceToHost);
-    cudaMemcpy(perFace.data(), dev_lightFaceLedger, perFace.size() * sizeof(LightLedger),
-        cudaMemcpyDeviceToHost);
-    cudaMemcpy(&folded, dev_foldedLedger, sizeof(LightLedger), cudaMemcpyDeviceToHost);
-    LightLedger foldedAbove;
-    cudaMemcpy(&foldedAbove, dev_foldedAboveLedger, sizeof(LightLedger), cudaMemcpyDeviceToHost);
-
-    LightLedger total = {};
-    // The last row is the distant light, which is not an area light and so has
-    // no entry in the light list.
-    for (int i = 0; i <= h_lightCount; i++)
-    {
-        addLedger(total, perLight[i]);
-    }
-    if (total.samples == 0)
-    {
-        return;
-    }
-
-    printf("[lights] %llu samples (%.2f per camera ray): %.1f%% accepted, %.1f%% below the "
-        "shading horizon, %.1f%% behind the sampled face, %.1f%% occluded\n",
-        total.samples, (double)total.samples / (double)pixelcount,
-        100.0 * (double)total.accepted / (double)total.samples,
-        100.0 * (double)total.rejectCosSurface / (double)total.samples,
-        100.0 * (double)total.rejectCosLight / (double)total.samples,
-        100.0 * (double)total.occluded / (double)total.samples);
-
-    for (int i = 0; i < h_lightCount; i++)
-    {
-        const LightLedger& row = perLight[i];
-        printf("[lights] light %d: %llu samples, %.1f%% accepted, %.4g units of accepted energy, "
-            "%llu non finite\n",
-            i, row.samples,
-            100.0 * (double)row.accepted / (double)glm::max(row.samples, 1ull), row.acceptedEnergy,
-            row.nonFiniteEnergy);
-        for (int face = 0; face < LIGHT_SAMPLE_FACES; face++)
-        {
-            const LightLedger& faceRow = perFace[(size_t)i * LIGHT_SAMPLE_FACES + face];
-            if (faceRow.samples == 0)
-            {
-                continue;
-            }
-            printf("[lights]   face %s: %llu samples, %.1f%% accepted | rejected: horizon %llu, "
-                "behind the face %llu, occluded %llu | %.4g units of accepted energy\n",
-                lightFaceName(face), faceRow.samples,
-                100.0 * (double)faceRow.accepted / (double)faceRow.samples,
-                faceRow.rejectCosSurface, faceRow.rejectCosLight, faceRow.occluded,
-                faceRow.acceptedEnergy);
-        }
-    }
-    {
-        const LightLedger& row = perLight[h_lightCount];
-        if (row.samples > 0)
-        {
-            printf("[lights] distant light: %llu samples, %.1f%% accepted, %.4g units of accepted "
-                "energy (rejected: horizon %llu, occluded %llu)\n",
-                row.samples,
-                100.0 * (double)row.accepted / (double)glm::max(row.samples, 1ull),
-                row.acceptedEnergy, row.rejectCosSurface, row.occluded);
-        }
-    }
-
-    // The estimator against the one it replaced: same integral over the same
-    // vertices, so the two totals agree in expectation
-    if (folded.bsdfHits == 0 || total.accepted == 0)
-    {
-        printf("[lights] energy check: no samples to compare\n");
-        return;
-    }
-    const double nee = total.acceptedEnergy + folded.bsdfEnergy;
-    const double fold = folded.bsdfEnergyPlain;
-    // Trials are the light samples, not the non-zero outcomes: dividing by the
-    // survivors would collapse the variance to a precision we do not have.
-    const double trials = (double)total.samples;
-    const double foldVar = glm::max(folded.bsdfEnergySq - fold * fold / trials, 0.0);
-    const double noise = sqrt(foldVar);
-    printf("[lights] energy check: the multiple importance sampling estimator %.6g (light strategy "
-        "%.6g + weighted emitter hits %.6g) against the %llu unweighted BSDF emitter hits %.6g "
-        "(+-%.3f%%) over %.3g light samples: %+.3f%% +- %.3f%%\n",
-        nee, total.acceptedEnergy, folded.bsdfEnergy,
-        folded.bsdfHits, fold, 100.0 * sqrt(foldVar) / fold, trials,
-        100.0 * (nee - fold) / fold, 100.0 * noise / fold);
-    printf("[lights]   of the BSDF hits, %llu (%+.3f%% of their energy) came from above the "
-        "light's own bottom plane: %.6g units\n",
-        foldedAbove.bsdfHits,
-        100.0 * foldedAbove.bsdfEnergy / fold, foldedAbove.bsdfEnergy);
-    std::vector<LightLedger> foldedFace(2 * LIGHT_SAMPLE_FACES);
-    cudaMemcpy(foldedFace.data(), dev_foldedFaceLedger, foldedFace.size() * sizeof(LightLedger),
-        cudaMemcpyDeviceToHost);
-    for (int side = 0; side < 2; side++)
-    {
-        printf("[lights]   BSDF hits by light face, %s:", side ? "from above" : "from below");
-        for (int face = 0; face < LIGHT_SAMPLE_FACES; face++)
-        {
-            const LightLedger& row = foldedFace[face + LIGHT_SAMPLE_FACES * side];
-            printf(" %s=%llu/%.3g%%", lightFaceName(face), row.bsdfHits,
-                100.0 * row.bsdfEnergy / fold);
-        }
-        printf("\n");
-    }
-#else
-    (void)pixelcount;
-#endif
-}
-
-// --- Direct lighting: device side ----------------------------------------
-
-#if DIRECT_LIGHT_SAMPLING && DIRECT_LIGHT_STATS
-#endif
-
-
-
 
 void InitDataContainer(GuiDataContainer* imGuiData)
 {
@@ -620,22 +272,6 @@ void pathtraceInit(Scene* scene)
     h_materialKeys.assign(pixelcount, 0);
 #endif
 
-    stageTrace.init();
-    stageSort.init();
-    stageShade.init();
-
-    h_profileIters = 0;
-    for (int i = 0; i < MAX_PROFILE_DEPTH; i++)
-    {
-        h_bounceAlive[i] = 0;
-    }
-
-    // Instrumentation for the procedural shapes (sphere tracing steps).
-    cudaMalloc(&dev_sdfSteps, sizeof(unsigned long long));
-    cudaMemset(dev_sdfSteps, 0, sizeof(unsigned long long));
-    cudaMalloc(&dev_sdfHistogram, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
-    cudaMemset(dev_sdfHistogram, 0, SDF_HISTOGRAM_BUCKETS * sizeof(unsigned long long));
-
     // --- Direct lighting: build the light list ---------------------------
     // The unit box the base code intersects is [-0.5, 0.5]^3, so transforming
     // its eight corners gives the world space extents of the emissive geometry.
@@ -705,31 +341,8 @@ void pathtraceInit(Scene* scene)
         printf("[lights] %d emitter(s), %.2f units^2 of emitting surface\n",
             h_lightCount, h_totalLightArea);
     }
-#if DIRECT_LIGHT_STATS
-    {
-        // One row per area light, plus one for the distant light (not a geometry,
-        // so it gets the last row instead of an entry in the light list).
-        cudaMalloc(&dev_lightLedger, (h_lightCount + 1) * sizeof(LightLedger));
-        cudaMemset(dev_lightLedger, 0, (h_lightCount + 1) * sizeof(LightLedger));
-        cudaMalloc(&dev_lightFaceLedger,
-            (size_t)glm::max(h_lightCount, 1) * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
-        cudaMemset(dev_lightFaceLedger, 0,
-            (size_t)glm::max(h_lightCount, 1) * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
-        cudaMalloc(&dev_foldedLedger, sizeof(LightLedger));
-        cudaMemset(dev_foldedLedger, 0, sizeof(LightLedger));
-        cudaMalloc(&dev_foldedFaceLedger, 2 * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
-        cudaMemset(dev_foldedFaceLedger, 0, 2 * LIGHT_SAMPLE_FACES * sizeof(LightLedger));
-        cudaMalloc(&dev_foldedAboveLedger, sizeof(LightLedger));
-        cudaMemset(dev_foldedAboveLedger, 0, sizeof(LightLedger));
-    }
-#endif
-
-    cudaMalloc(&dev_rrDecisions, sizeof(unsigned long long));
-    cudaMemset(dev_rrDecisions, 0, sizeof(unsigned long long));
-    cudaMalloc(&dev_rrKills, sizeof(unsigned long long));
-    cudaMemset(dev_rrKills, 0, sizeof(unsigned long long));
-    cudaMalloc(&dev_rrSurvivalMilli, sizeof(unsigned long long));
-    cudaMemset(dev_rrSurvivalMilli, 0, sizeof(unsigned long long));
+    // The instrumentation owns its counters; it needs the light count for the ledger.
+    statsInit(h_lightCount);
 
     checkCUDAError("pathtraceInit");
 }
@@ -763,31 +376,9 @@ void pathtraceFree()
     dev_bucketCounts = NULL;
     dev_bucketOffsets = NULL;
     dev_bucketCursors = NULL;
-    stageTrace.destroy();
-    stageSort.destroy();
-    stageShade.destroy();
-    cudaFree(dev_sdfSteps);
-    cudaFree(dev_sdfHistogram);
-    dev_sdfSteps = NULL;
-    dev_sdfHistogram = NULL;
-    cudaFree(dev_rrDecisions);
-    cudaFree(dev_rrKills);
-    cudaFree(dev_rrSurvivalMilli);
     cudaFree(dev_lights);   // no-op if the scene has no emitters
-    cudaFree(dev_lightLedger);
-    cudaFree(dev_lightFaceLedger);
-    cudaFree(dev_foldedLedger);
-    cudaFree(dev_foldedAboveLedger);
-    cudaFree(dev_foldedFaceLedger);
-    dev_rrDecisions = NULL;
-    dev_rrKills = NULL;
-    dev_rrSurvivalMilli = NULL;
     dev_lights = NULL;
-    dev_lightLedger = NULL;
-    dev_lightFaceLedger = NULL;
-    dev_foldedLedger = NULL;
-    dev_foldedAboveLedger = NULL;
-    dev_foldedFaceLedger = NULL;
+    statsFree();
     h_lightInfo.clear();
     checkpointRelease();
 
@@ -1708,7 +1299,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         dim3 numblocksPathSegmentTracing = (num_paths + blockSize1d - 1) / blockSize1d;
 
         // tracing
-        stageTrace.begin();
+        statsTrace().begin();
         computeIntersections<<<numblocksPathSegmentTracing, blockSize1d>>> (
             depth,
             num_paths,
@@ -1716,12 +1307,12 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             dev_geoms,
             hst_scene->geoms.size(),
             intersections,
-            dev_sdfSteps,
-            dev_sdfHistogram,
+            statsSdfSteps(),
+            statsSdfHistogram(),
             h_bvhActive ? dev_bvhNodes : NULL,
             h_bvhActive ? dev_bvhPrimitiveIds : NULL
         );
-        stageTrace.end();
+        statsTrace().end();
         checkCUDAError("trace one bounce");
 
         // --- Sorting stage ---
@@ -1743,10 +1334,10 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         }
 #endif
 #if SORT_BY_MATERIAL
-        stageSort.begin();
+        statsSort().begin();
         sortPathsByMaterial(num_paths, paths, pathsOther, intersections, intersectionsOther,
             (int)hst_scene->materials.size(), reportMix);
-        stageSort.end();
+        statsSort().end();
         {
             PathSegment* tmpPaths = paths;
             paths = pathsOther;
@@ -1760,7 +1351,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         // --- Shading Stage ---
         // Evaluate the BSDF, accumulate emitter hits into dev_image and generate
         // the next ray of every still-living path
-        stageShade.begin();
+        statsShade().begin();
         shadeMaterials<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
             depth,
@@ -1775,21 +1366,21 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             h_totalLightArea,
             hst_scene->state.environment,
             hst_scene->state.distantLight,
-            dev_lightLedger,
-            dev_lightFaceLedger,
-            dev_foldedLedger,
-            dev_foldedAboveLedger,
-            dev_foldedFaceLedger,
-            dev_rrDecisions,
-            dev_rrKills,
-            dev_rrSurvivalMilli,
+            statsLightLedger(),
+            statsLightFaceLedger(),
+            statsFoldedLedger(),
+            statsFoldedAboveLedger(),
+            statsFoldedFaceLedger(),
+            statsRrDecisions(),
+            statsRrKills(),
+            statsRrSurvivalMilli(),
             dev_image,
             h_bvhActive ? dev_bvhNodes : NULL,
             h_bvhActive ? dev_bvhPrimitiveIds : NULL,
             dev_firstNormal,
             dev_firstAlbedo
         );
-        stageShade.end();
+        statsShade().end();
         checkCUDAError("shade one bounce");
 
         depth++;
@@ -1806,27 +1397,12 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         }
 #endif
 
-		// --- Bounce profile statistics ---
         if (guiData != NULL) { guiData->TracedDepth = depth; }
-        if (depth <= MAX_PROFILE_DEPTH) { h_bounceAlive[depth - 1] += num_paths; }
+        statsRecordBounce(depth, num_paths);
     }
 
-	// --- Iteration statistics ---
-    h_profileIters++;
-    if (iter == 1)
-    {
-        printBounceProfile("iteration 1 - paths processed after each bounce:",
-            h_bounceAlive, maxSegments, 1, pixelcount);
-    }
-    if (iter >= hst_scene->state.iterations)
-    {
-        printBounceProfile("average over all iterations - paths processed after each bounce:",
-            h_bounceAlive, maxSegments, h_profileIters, pixelcount);
-        printSdfStats(pixelcount);
-        printRussianRouletteStats(pixelcount);
-        printDirectLightStats(pixelcount);
-        printStageTimings();
-    }
+    statsEndIteration(iter, hst_scene->state.iterations, maxSegments, pixelcount,
+        h_lightCount, DIRECT_LIGHT_SAMPLING != 0);
 
     // Send results to OpenGL buffer for rendering
     sendImageToPBO<<<blocksPerGrid2d, blockSize2d>>>(pbo, cam.resolution, iter, dev_image);
