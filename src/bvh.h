@@ -8,12 +8,11 @@
 #include <vector>
 
 // Compile-time knobs so the write-up can quote a measurement for each
-// The traversal stack is sized by the depth
 #define BVH_LEAF_SIZE 4
 #define BVH_MAX_DEPTH 48
 #define BVH_SAH_BINS 16
 
-// One node per entry of `nodes`, with the children being indices into that array.=
+// One node per entry of `nodes`, with the children being indices into that array
 struct BvhNode
 {
     glm::vec3 boundsMin;
@@ -39,7 +38,7 @@ struct Bvh
 // Build a bounding volume hierarchy for the given geometry
 void buildBvh(const std::vector<Geom>& geoms, Bvh& bvh);
 
-// Traversal stack size
+// Traversal stack: one entry per level, plus the pair a split node pushes at once
 #define BVH_STACK_SIZE (BVH_MAX_DEPTH + 4)
 
 // Stack-based traversal of the BVH, returning the closest hit along the ray

@@ -1062,9 +1062,7 @@ __global__ void kernScatterByMaterial(
 #endif
 
 #if MATERIAL_SORT_STATS
-// The share of 32-lane warps that see a single material, plus the mean and worst
-// number of materials per warp. Taken on the host from the same keys the sort
-// uses, so it never touches the shading kernel it is explaining.
+// Report the material mix in the path stream, before or after a sort
 static void reportMaterialMix(int numPaths, const ShadeableIntersection* intersections,
     int materialCount, const char* tag)
 {
@@ -1131,10 +1129,8 @@ static void reportMaterialMix(int numPaths, const ShadeableIntersection* interse
 #endif
 
 #if SORT_BY_MATERIAL
-// Reorder paths and intersections so that the paths which hit the same material
- *  sit next to each other: a warp holding a mix of them runs the shading branches
- *  one after the other with the other lanes masked off. Costs key, histogram,
- *  scan and scatter after every bounce; a permutation, so nothing is dropped. */
+// Sort the paths by material so the shading kernel sees a run of paths with the same
+// material: one BSDF branch per warp instead of one per lane
 static int sortPathsByMaterial(
     int numPaths,
     PathSegment* paths,
