@@ -20,10 +20,21 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
+
+#ifdef _WIN32
+    // The scene picker is the OS file dialog: there is no third party browser to
+    // vendor, it filters by extension itself, and GLFW_EXPOSE_NATIVE_WIN32 gives us
+    // the window handle so it opens over the renderer instead of behind it.
+    #define GLFW_EXPOSE_NATIVE_WIN32
+    #include "GLFW/glfw3native.h"
+    #include <windows.h>
+    #include <commdlg.h>
+#endif
 
 static std::string startTimeString;
 
@@ -62,6 +73,20 @@ GLFWwindow* window;
 GuiDataContainer* imguiData = NULL;
 ImGuiIO* io = nullptr;
 bool mouseOverImGuiWinow = false;
+
+// Interactive scene loading
+//
+// A scene on the command line keeps the old behaviour exactly: render it, save the
+// image and exit, which is what the measurement runs rely on. Started with no
+// argument the renderer opens empty instead, with a "Load data" button in the top
+// right corner; a scene picked there is loaded into the running process and starts
+// accumulating immediately, and finishing it keeps the window open.
+static bool guiMode = false;
+static bool renderActive = false;       // the sample loop should advance
+static bool renderFinished = false;     // reached ITS iterations, image kept
+static std::string scenePath;
+static std::string statusMessage = "No scene loaded - click Load data.";
+static std::string dialogDir;           // remembered between file dialogs
 
 // Forward declarations for window loop and interactivity
 void runCuda();
@@ -197,6 +222,114 @@ void initPBO()
     // Allocate data for the buffer. 4-channel 8-bit image
     glBufferData(GL_PIXEL_UNPACK_BUFFER, size_tex_data, NULL, GL_DYNAMIC_COPY);
     cudaGLRegisterBufferObject(pbo);
+
+    // Leave the unpack target unbound. ImGui uploads its font atlas with one
+    // glTexImage2D on the first frame, and while a pixel unpack buffer is bound the
+    // pixel pointer is read as an offset into that buffer instead of a host address:
+    // the upload fails with GL_INVALID_OPERATION, the atlas texture keeps no storage
+    // and every ImGui draw (window, button, glyph) samples as black.
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Loading a scene into the running renderer
+// ---------------------------------------------------------------------------
+
+#ifdef _WIN32
+std::string pickSceneFile()
+{
+    char fileName[MAX_PATH] = "";
+
+    OPENFILENAMEA ofn;
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = glfwGetWin32Window(window);
+    ofn.lpstrFilter = "Scene (*.json)\0*.json\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = "Load data";
+    ofn.lpstrInitialDir = dialogDir.empty() ? NULL : dialogDir.c_str();
+    // OFN_NOCHANGEDIR: the renderer writes its image and checkpoint next to the
+    // working directory, so the dialog must not move it.
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    if (GetOpenFileNameA(&ofn) == TRUE)
+    {
+        return std::string(fileName);
+    }
+    return std::string();
+}
+#endif
+
+bool loadScene(const std::string& path)
+{
+    const std::filesystem::path file(path);
+    if (file.extension() != ".json")
+    {
+        statusMessage = "Not a scene: " + path + " (only .json scenes are loadable)";
+        return false;
+    }
+
+    Scene* next = NULL;
+    try
+    {
+        next = new Scene(path);
+    }
+    catch (const std::exception& e)
+    {
+        statusMessage = "Could not load " + path + ": " + e.what();
+        return false;
+    }
+
+    // The device buffers point into the old scene, so they go first
+    if (scene != NULL)
+    {
+        pathtraceFree();
+        delete scene;
+        scene = NULL;
+    }
+
+    scene = next;
+    renderState = &scene->state;
+
+    // The interactive camera is an orbit camera around the scene's look at point
+    const Camera& cam = renderState->camera;
+    cameraPosition = cam.position;
+    ogLookAt = cam.lookAt;
+    const glm::vec3 eyeOffset = cam.position - cam.lookAt;
+    zoom = glm::length(eyeOffset);
+    const glm::vec3 forward = -eyeOffset / zoom;
+    theta = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
+    phi = glm::atan(-forward.x, -forward.z);
+    camchanged = true;
+
+    // A different resolution means a different texture and pixel buffer
+    if (width != cam.resolution.x || height != cam.resolution.y)
+    {
+        width = cam.resolution.x;
+        height = cam.resolution.y;
+        glfwSetWindowSize(window, width, height);
+        cleanupCuda();
+        initTextures();
+        initPBO();
+        glViewport(0, 0, width, height);
+    }
+
+    iteration = 0;
+    renderActive = true;
+    renderFinished = false;
+    scenePath = path;
+    dialogDir = file.parent_path().string();
+    statusMessage = "Rendering " + file.filename().string();
+
+    printf("[gui] loaded %s: %d x %d, %d samples, depth %d\n", path.c_str(), width, height,
+        renderState->iterations, renderState->traceDepth);
+    return true;
+}
+
+void framebufferSizeCallback(GLFWwindow* window, int newWidth, int newHeight)
+{
+    glViewport(0, 0, newWidth, newHeight);
 }
 
 void errorCallback(int error, const char* description)
@@ -223,6 +356,7 @@ bool init()
     glfwSetKeyCallback(window, keyCallback);
     glfwSetCursorPosCallback(window, mousePositionCallback);
     glfwSetMouseButtonCallback(window, mouseButtonCallback);
+    glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
 
     // Set up GL context
     glewExperimental = GL_TRUE;
@@ -274,24 +408,50 @@ void RenderImGui()
     static float f = 0.0f;
     static int counter = 0;
 
-    ImGui::Begin("Path Tracer Analytics");                  // Create a window called "Hello, world!" and append into it.
-    
-    // LOOK: Un-Comment to check the output window and usage
-    //ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
-    //ImGui::Checkbox("Demo Window", &show_demo_window);      // Edit bools storing our window open/close state
-    //ImGui::Checkbox("Another Window", &show_another_window);
-
-    //ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
-    //ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
-
-    //if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-    //    counter++;
-    //ImGui::SameLine();
-    //ImGui::Text("counter = %d", counter);
+    ImGui::Begin("Path Tracer Analytics");                 
     ImGui::Text("Traced Depth %d", imguiData->TracedDepth);
     ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
     ImGui::End();
 
+    // Top right: the only control so far. Load a scene and it starts rendering.
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - 12.0f, viewport->WorkPos.y + 12.0f),
+        ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.9f);
+    const ImGuiWindowFlags loadFlags = ImGuiWindowFlags_NoDecoration
+        | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize
+        | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing
+        | ImGuiWindowFlags_NoNav;
+    if (ImGui::Begin("##load", NULL, loadFlags))
+    {
+        if (ImGui::Button("Load data", ImVec2(150.0f, 0.0f)))
+        {
+#ifdef _WIN32
+            const std::string picked = pickSceneFile();
+            if (!picked.empty())
+            {
+                loadScene(picked);
+            }
+#else
+            statusMessage = "The file dialog is Windows only; pass the scene on the command line";
+#endif
+        }
+
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 340.0f);
+        ImGui::TextWrapped("%s", statusMessage.c_str());
+        ImGui::PopTextWrapPos();
+
+        if (scene != NULL)
+        {
+            ImGui::Text("%d x %d - %d / %d samples", width, height, iteration,
+                renderState->iterations);
+        }
+#ifndef NDEBUG
+        ImGui::TextColored(ImVec4(0.85f, 0.25f, 0.10f, 1.0f), "Debug build: about 25x slower than Release");
+#endif
+    }
+    ImGui::End();
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -311,18 +471,40 @@ void mainLoop()
 
         runCuda();
 
-        std::string title = "CIS565 Path Tracer | " + utilityCore::convertIntToString(iteration) + " Iterations";
+        std::string title = "CIS565 Path Tracer | ";
+        if (scene == NULL)
+        {
+            title += "no scene - Load data";
+        }
+        else if (renderFinished)
+        {
+            title += "finished " + utilityCore::convertIntToString(iteration) + " samples";
+        }
+        else
+        {
+            title += utilityCore::convertIntToString(iteration) + " Iterations";
+        }
         glfwSetWindowTitle(window, title.c_str());
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-        glBindTexture(GL_TEXTURE_2D, displayImage);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glClear(GL_COLOR_BUFFER_BIT);
 
-        // Binding GL_PIXEL_UNPACK_BUFFER back to default
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        if (scene == NULL)
+        {
+            // Nothing rendered yet: a plain background behind the Load data button
+            glClearColor(0.10f, 0.11f, 0.13f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+        else
+        {
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            glBindTexture(GL_TEXTURE_2D, displayImage);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glClear(GL_COLOR_BUFFER_BIT);
 
-        // VAO, shader program, and texture already bound
-        glDrawElements(GL_TRIANGLES, 6,  GL_UNSIGNED_SHORT, 0);
+            // Binding GL_PIXEL_UNPACK_BUFFER back to default
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+            // VAO, shader program, and texture already bound
+            glDrawElements(GL_TRIANGLES, 6,  GL_UNSIGNED_SHORT, 0);
+        }
 
         // Render ImGui Stuff
         RenderImGui();
@@ -346,36 +528,53 @@ int main(int argc, char** argv)
 {
     startTimeString = currentTimeString();
 
-    if (argc < 2)
+#ifndef NDEBUG
+    printf("[build] this is a Debug build: rendering is about 25x slower than Release "
+        "(measured on this scene set); use out\\build\\x64-Release for interactive work\n");
+#endif
+
+    // A scene argument keeps the command line behaviour: render it and exit. With
+    // no argument the window opens empty and the Load data button picks one.
+    guiMode = (argc < 2);
+    scene = NULL;
+    if (guiMode)
     {
-        printf("Usage: %s SCENEFILE.json\n", argv[0]);
-        return 1;
+        width = 1280;
+        height = 720;
+        printf("No scene on the command line: click \"Load data\" in the top right corner\n");
     }
-
-    const char* sceneFile = argv[1];
-
-    // Load scene file
-    scene = new Scene(sceneFile);
+    else
+    {
+        // Load scene file
+        scene = new Scene(argv[1]);
+    }
 
     //Create Instance for ImGUIData
     guiData = new GuiDataContainer();
 
-    // Set up camera stuff from loaded path tracer settings
     iteration = 0;
-    renderState = &scene->state;
-    Camera& cam = renderState->camera;
-    width = cam.resolution.x;
-    height = cam.resolution.y;
+    renderActive = (scene != NULL);
+    if (scene != NULL)
+    {
+        scenePath = argv[1];
+        statusMessage = "Rendering " + std::filesystem::path(scenePath).filename().string();
 
-    cameraPosition = cam.position;
+        // Set up camera stuff from loaded path tracer settings
+        renderState = &scene->state;
+        Camera& cam = renderState->camera;
+        width = cam.resolution.x;
+        height = cam.resolution.y;
 
-    // The interactive camera is an orbit camera
-    ogLookAt = cam.lookAt;
-    glm::vec3 eyeOffset = cam.position - ogLookAt;
-    zoom = glm::length(eyeOffset);
-    glm::vec3 forward = -eyeOffset / zoom;   // unit vector eye -> look-at
-    theta = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
-    phi = glm::atan(-forward.x, -forward.z);
+        cameraPosition = cam.position;
+
+        // The interactive camera is an orbit camera
+        ogLookAt = cam.lookAt;
+        glm::vec3 eyeOffset = cam.position - ogLookAt;
+        zoom = glm::length(eyeOffset);
+        glm::vec3 forward = -eyeOffset / zoom;   // unit vector eye -> look-at
+        theta = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
+        phi = glm::atan(-forward.x, -forward.z);
+    }
 
     // Initialize CUDA and GL components
     init();
@@ -454,6 +653,25 @@ void saveImage()
 
 void runCuda()
 {
+    if (scene == NULL)
+    {
+        return;                     // nothing loaded yet: the GUI is all there is
+    }
+    if (renderFinished)
+    {
+        if (!camchanged)
+        {
+            return;                 // hold the finished image
+        }
+        iteration = 0;              // the camera moved: accumulate it again
+        renderActive = true;
+        renderFinished = false;
+    }
+    if (!renderActive)
+    {
+        return;
+    }
+
     if (camchanged)
     {
         iteration = 0;
@@ -553,9 +771,19 @@ void runCuda()
         // start skip straight to the end.
         pathtraceDeleteCheckpoint(scene);
         printCheckpointStats();
-        pathtraceFree();
-        cudaDeviceReset();
-        exit(EXIT_SUCCESS);
+        if (!guiMode)
+        {
+            pathtraceFree();
+            cudaDeviceReset();
+            exit(EXIT_SUCCESS);
+        }
+        // GUI: keep the window, the image and the device buffers so another scene
+        // can be loaded, or the camera dragged, without restarting the process.
+        renderActive = false;
+        renderFinished = true;
+        statusMessage = "Finished " + renderState->imageName + " at "
+            + utilityCore::convertIntToString(iteration) + " samples - load another scene";
+        printf("[gui] finished %s at %d samples\n", renderState->imageName.c_str(), iteration);
     }
 }
 
@@ -570,16 +798,27 @@ void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods
         switch (key)
         {
             case GLFW_KEY_ESCAPE:
-                saveImage();
-                pathtraceSaveCheckpoint(scene, iteration);
-                printCheckpointStats();
+                if (scene != NULL)
+                {
+                    saveImage();
+                    pathtraceSaveCheckpoint(scene, iteration);
+                    printCheckpointStats();
+                }
                 glfwSetWindowShouldClose(window, GL_TRUE);
                 break;
             case GLFW_KEY_S:
+                if (scene == NULL)
+                {
+                    break;                          // nothing to save yet
+                }
                 saveImage();
                 pathtraceSaveCheckpoint(scene, iteration);
                 break;
             case GLFW_KEY_SPACE:
+                if (scene == NULL)
+                {
+                    break;
+                }
                 camchanged = true;
                 renderState = &scene->state;
                 Camera& cam = renderState->camera;
@@ -622,7 +861,7 @@ void mousePositionCallback(GLFWwindow* window, double xpos, double ypos)
         zoom = std::fmax(0.1f, zoom);
         camchanged = true;
     }
-    else if (middleMousePressed)
+    else if (middleMousePressed && scene != NULL)
     {
         renderState = &scene->state;
         Camera& cam = renderState->camera;
