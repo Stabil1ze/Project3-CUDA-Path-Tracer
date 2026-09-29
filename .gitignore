@@ -570,3 +570,9 @@ assets/meshes/*.ply
 # Visual Studio's CMake configuration list: per machine, and it is what named a build
 # configuration "x64-Release" while building RelWithDebInfo
 CMakeSettings.json
+
+# Rendered output and checkpoints when a render is launched from the repository root
+# (the normal working directory is the gitignored out/run/)
+/*.png
+*.ckpt
+*.denoised.png
