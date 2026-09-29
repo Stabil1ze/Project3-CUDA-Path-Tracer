@@ -43,24 +43,24 @@ lens camera and the procedural shapes and textures.
 | 4 | Stream compaction of terminated paths - map / scan / scatter built on the work-efficient scan from my Project 2 | `src/pathtrace.cu`, `stream_compaction/` |
 | 5 | Sorting the paths by material (key / histogram / scan / scatter) so that a warp of the shading kernel runs one BSDF branch instead of one per lane. Implemented and measured, **off by default**: it makes warps uniform (0% -> 99%) but costs more than it saves here | `src/pathtrace.cu` |
 | 6 | Emitter hits accumulate straight into the image, which is what allows terminated paths to be dropped | `src/pathtrace.cu` |
-| 7 | Per-bounce ray counting for the analysis (`[profile] ...` on stdout), plus CUDA-event timings per stage (`[stage] ...`) | `src/pathtrace.cu` |
+| 7 | Per-bounce ray counting for the analysis (`[profile] ...` on stdout), plus CUDA-event timings per stage (`[stage] ...`) | `src/stats.h`, `src/stats.cu` |
 | 8 | Physically based depth of field: thin lens camera driven by two optional scene fields (`APERTURE`, `FOCUS`), off by default | `src/pathtrace.cu`, `src/scene.cpp` |
 | 9 | Camera basis and orbit camera fixes (the base code mirrored the pitch and put the eye below the floor whenever a scene looked downwards) | `src/scene.cpp`, `src/main.cpp` |
 | 10 | Procedural shapes: a power-8 Mandelbulb and a Menger sponge, signed distance fields intersected by sphere tracing with a bounding sphere broad phase | `src/intersections.cu` |
 | 11 | Procedural textures: checker and marble, evaluated on the object space hit point so they work on any shape | `src/interactions.cu` |
-| 12 | Restartable rendering: the accumulation buffer and sample count are checkpointed to `<FILE>.ckpt` and picked up again on the next start | `src/pathtrace.cu`, `src/main.cpp` |
+| 12 | Restartable rendering: the accumulation buffer and sample count are checkpointed to `<FILE>.ckpt` and picked up again on the next start | `src/checkpoint.h`, `src/checkpoint.cu`, `src/main.cpp` |
 | 13 | Russian roulette: paths are killed with a probability that grows as their throughput shrinks, and the survivors are divided by the survival probability | `src/pathtrace.cu` |
 | 14 | Refraction: a smooth dielectric BSDF with Schlick Fresnel, total internal reflection and the radiance scaling of a refractive interface | `src/interactions.cu`, `src/scene.cpp` |
 | 15 | Glossy specular: a GGX microfacet lobe with Smith masking-shadowing and importance sampling of the visible normal distribution | `src/ggx.h`, `src/interactions.cu` |
 | 16 | Low-discrepancy sampling: a scrambled Halton sequence for the pixel area and the lens, kept off the path dimensions after measuring both | `src/sampling.h`, `src/pathtrace.cu` |
-| 17 | Direct light sampling (next event estimation): every diffuse vertex is connected to a random point on the surface of a random light, with a shadow ray and a ledger that measures what the estimator delivers against what it replaced | `src/pathtrace.cu` |
+| 17 | Direct light sampling (next event estimation): every diffuse vertex is connected to a random point on the surface of a random light, with a shadow ray and a ledger that measures what the estimator delivers against what it replaced | `src/lights.h`, `src/pathtrace.cu` |
 | 18 | Three part material system: `bsdfSample` / `bsdfEval` / `bsdfPdf` in `src/bsdf.h`, one lobe mixture shared by the path sampler and the light estimator | `src/bsdf.h` |
-| 19 | Multiple importance sampling (power heuristic) between the light strategy, the BSDF strategy and the delta lobes, which is what makes the estimator better than path sampling for *any* light size | `src/pathtrace.cu` |
-| 20 | Environment light (dome): a three colour sky seen by every escaping ray, i.e. an infinite area light that lights an open scene | `src/pathtrace.cu`, `src/scene.cpp` |
-| 21 | Distant light (sun): a disc at infinity, sampled by solid angle and combined with the paths that walk into it | `src/pathtrace.cu`, `src/scene.cpp` |
-| 22 | Spherical area lights sampled by solid angle over their tangent cone (a box is still sampled by area, which is exactly rectangle sampling) | `src/pathtrace.cu` |
-| 23 | Mesh loading: a self-contained Wavefront OBJ parser that turns every triangle into a `TRIANGLE` geometry, so a mesh takes the same material, transform, texture and acceleration structure as any primitive | `src/mesh.cpp`, `src/intersections.cu` |
-| 24 | Bounding volume hierarchy: binned SAH build on the CPU, iterative traversal on the GPU, over every primitive in the scene at once | `src/bvh.cpp`, `src/pathtrace.cu` |
+| 19 | Multiple importance sampling (power heuristic) between the light strategy, the BSDF strategy and the delta lobes, which is what makes the estimator better than path sampling for *any* light size | `src/lights.h`, `src/pathtrace.cu` |
+| 20 | Environment light (dome): a three colour sky seen by every escaping ray, i.e. an infinite area light that lights an open scene | `src/lights.h`, `src/pathtrace.cu`, `src/scene.cpp` |
+| 21 | Distant light (sun): a disc at infinity, sampled by solid angle and combined with the paths that walk into it | `src/lights.h`, `src/pathtrace.cu`, `src/scene.cpp` |
+| 22 | Spherical area lights sampled by solid angle over their tangent cone (a box is still sampled by area, which is exactly rectangle sampling) | `src/lights.h`, `src/pathtrace.cu` |
+| 23 | Mesh loading: self-contained Wavefront OBJ and PLY parsers, each turning a triangle into a `TRIANGLE` geometry so a mesh takes the same material, transform, texture and acceleration structure as any primitive | `src/mesh.cpp`, `src/intersections.cu` |
+| 24 | Bounding volume hierarchy: binned SAH build on the CPU, iterative traversal on the GPU, over every primitive in the scene at once | `src/bvh.cpp`, `src/bvh.h` |
 | 25 | Denoising: Intel Open Image Denoise with the first hit's normal and albedo as guides, on the CUDA device when the package's plugin loads | `src/denoise.cpp` |
 
 The features that change the image (#3, #4, #5) are behind `#define`s
@@ -1552,11 +1552,14 @@ itself, an acceleration structure that makes a real asset affordable, and a
 denoiser that makes a preview worth looking at. All three are new here, so the
 measurements are a first cut.
 
-**Mesh loading.** A mesh is an OBJ file the scene names, parsed by a small
-loader of my own (`src/mesh.cpp`: `v`, `vn`, `f` with all four corner forms,
-relative indices, fan triangulation, missing normals replaced by the face
-normal). Every triangle becomes one `TRIANGLE` geometry carrying the mesh's
-transform, which is the decision that matters:
+**Mesh loading.** A mesh is an OBJ or PLY file the scene names, parsed by a small
+loader of my own (`src/mesh.cpp`): OBJ `v`, `vn`, `f` with all four corner forms
+and relative indices; PLY in all three formats, with the vertex properties found
+by name in the header's own order. Polygons are fan triangulated, a missing
+normal array falls back to the face normal, and an index past the end of the
+file's own vertex array drops that triangle. Every triangle becomes one
+`TRIANGLE` geometry carrying the mesh's transform, which is the decision that
+matters:
 
 * the same materials as any other object, so a mesh can be diffuse, glossy,
   glass or an emitter with no new code;
@@ -1567,9 +1570,12 @@ transform, which is the decision that matters:
   structure.
 
 A mesh file is named relative to the *scene file*, not the working directory, so
-scenes stay portable. Loading `assets/meshes/gargoyle.obj` (20 000 triangles
-from 10 229 vertices) takes 161 ms and is the only per-file cost; everything
-downstream sees triangles.
+scenes stay portable. The mesh files themselves are not committed - `assets/meshes/`
+is ignored, since they are large third-party data (see the credits) - so drop your
+own copy in before running `scenes/mesh.json`; the loaders, the scenes and the
+rendered images are all in the repository. Loading `assets/meshes/gargoyle.obj`
+(20 000 triangles from 10 229 vertices) takes 161 ms and is the only per-file cost;
+everything downstream sees triangles.
 
 ![](img/mesh.png)
 
@@ -1598,7 +1604,7 @@ twenty thousand triangles are not. The hierarchy is built on the host
 (`src/bvh.cpp`) over *every* primitive of the scene - analytic shapes,
 procedural SDFs and mesh triangles alike - with the surface area heuristic over
 16 bins, a leaf size of 4 and a depth cap of 48, and uploaded as a flat array.
-The GPU side (`pathtrace.cu`) walks it iteratively with an explicit stack of
+The GPU side (`src/bvh.h`) walks it iteratively with an explicit stack of
 node indices, visiting the nearer child first so that the current best hit cuts
 the far subtree off; the shadow rays use the same traversal with an early out.
 
@@ -1829,7 +1835,8 @@ uncommented to link my Project 2 implementation, and
   `out/run/`) from the CG2025 course's sample data, so **their provenance needs
   confirming with the course** before submission. The cube, the two UV spheres
   and the torus knot come from `out/run/make_meshes.py` and exist so the loader
-  can be checked against geometry with a closed form.
+  can be checked against geometry with a closed form. Neither set is committed
+  (`assets/meshes/` is ignored); the figures rendered from them are.
 * References used for the shading: PBRT v4 sections 9.2 (diffuse reflection) and
   9.3 (specular reflection and transmission), GPU Gems 3, Ch. 20 for the specular
   sampling model, Paul Bourke's raytracing notes for anti-aliasing, and PBRT v4
