@@ -25,6 +25,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
     // The scene picker is the OS file dialog: there is no third party browser to
@@ -87,6 +88,10 @@ static bool renderFinished = false;     // reached ITS iterations, image kept
 static std::string scenePath;
 static std::string statusMessage = "No scene loaded - click Load data.";
 static std::string dialogDir;           // remembered between file dialogs
+static bool sceneNeedsFullInit = true;  // the next frame at sample 0 has to (re)allocate
+static bool sceneEdited = false;        // the panel changed a value: restart accumulation
+static Camera homeCamera;               // as the scene file wrote it, for Reset camera
+static std::vector<int> panelLightIds;  // emitting materials, captured when a scene loads
 
 // Forward declarations for window loop and interactivity
 void runCuda();
@@ -235,6 +240,60 @@ void initPBO()
 // Loading a scene into the running renderer
 // ---------------------------------------------------------------------------
 
+/** The camera's vertical field of view drives three derived fields; the JSON loader
+ *  computes them the same way, so the panel has to redo it when the slider moves. */
+void applyVerticalFov(Camera& cam, float fovyDegrees)
+{
+    const float yscaled = tanf(glm::radians(fovyDegrees));
+    const float xscaled = yscaled * (float)cam.resolution.x / (float)cam.resolution.y;
+    cam.fov = glm::vec2(glm::degrees(atanf(xscaled)), fovyDegrees);
+    cam.pixelLength = glm::vec2(2.0f * xscaled / (float)cam.resolution.x,
+        2.0f * yscaled / (float)cam.resolution.y);
+}
+
+/** The orbit parameters the mouse drags, read back out of a camera. */
+void orbitFromCamera(const Camera& cam, glm::vec3& lookAt, float& distance, float& polar,
+    float& azimuth)
+{
+    lookAt = cam.lookAt;
+    const glm::vec3 eyeOffset = cam.position - cam.lookAt;
+    distance = glm::length(eyeOffset);
+    const glm::vec3 forward = -eyeOffset / distance;
+    polar = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
+    azimuth = glm::atan(-forward.x, -forward.z);
+}
+
+/** Elevation and azimuth of the direction the sun light comes from. */
+void sunAngles(const glm::vec3& direction, float& elevationDegrees, float& azimuthDegrees)
+{
+    const glm::vec3 toward = glm::normalize(-direction);
+    elevationDegrees = glm::degrees(glm::asin(glm::clamp(toward.y, -1.0f, 1.0f)));
+    azimuthDegrees = glm::degrees(glm::atan(toward.x, toward.z));
+}
+
+glm::vec3 sunDirection(float elevationDegrees, float azimuthDegrees)
+{
+    const float elevation = glm::radians(elevationDegrees);
+    const float azimuth = glm::radians(azimuthDegrees);
+    const glm::vec3 toward(glm::cos(elevation) * glm::sin(azimuth), glm::sin(elevation),
+        glm::cos(elevation) * glm::cos(azimuth));
+    return glm::normalize(-toward);
+}
+
+/** The materials that light this scene, captured once per load so that the panel
+ *  keeps their rows even when one of them is turned down to zero. */
+void captureEmitters(const Scene* scene)
+{
+    panelLightIds.clear();
+    for (size_t i = 0; i < scene->materials.size(); i++)
+    {
+        if (scene->materials[i].emittance > 0.0f)
+        {
+            panelLightIds.push_back((int)i);
+        }
+    }
+}
+
 #ifdef _WIN32
 std::string pickSceneFile()
 {
@@ -281,7 +340,8 @@ bool loadScene(const std::string& path)
         return false;
     }
 
-    // The device buffers point into the old scene, so they go first
+    // The device buffers point into the old scene, so they go first. The full init on
+    // the next frame frees again, which is why pathtraceFree has to be idempotent.
     if (scene != NULL)
     {
         pathtraceFree();
@@ -295,13 +355,13 @@ bool loadScene(const std::string& path)
     // The interactive camera is an orbit camera around the scene's look at point
     const Camera& cam = renderState->camera;
     cameraPosition = cam.position;
-    ogLookAt = cam.lookAt;
-    const glm::vec3 eyeOffset = cam.position - cam.lookAt;
-    zoom = glm::length(eyeOffset);
-    const glm::vec3 forward = -eyeOffset / zoom;
-    theta = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
-    phi = glm::atan(-forward.x, -forward.z);
+    orbitFromCamera(cam, ogLookAt, zoom, theta, phi);
     camchanged = true;
+
+    // What the panel starts from, and what Reset camera goes back to
+    homeCamera = cam;
+    captureEmitters(scene);
+    imguiData->TracedDepth = renderState->traceDepth;
 
     // A different resolution means a different texture and pixel buffer
     if (width != cam.resolution.x || height != cam.resolution.y)
@@ -318,6 +378,7 @@ bool loadScene(const std::string& path)
     iteration = 0;
     renderActive = true;
     renderFinished = false;
+    sceneNeedsFullInit = true;
     scenePath = path;
     dialogDir = file.parent_path().string();
     statusMessage = "Rendering " + file.filename().string();
@@ -453,6 +514,158 @@ void RenderImGui()
     }
     ImGui::End();
 
+    // The detailed panel: the camera, and the lights the scene is built from. Any
+    // edit restarts the accumulation, so the change is visible in the next samples.
+    if (scene != NULL)
+    {
+        ImGui::SetNextWindowPos(ImVec2(60.0f, 130.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(380.0f, 430.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Scene"))
+        {
+            Camera& cam = renderState->camera;
+
+            if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                float fovy = cam.fov.y;
+                if (ImGui::SliderFloat("FOVY (degrees)", &fovy, 5.0f, 120.0f, "%.1f"))
+                {
+                    applyVerticalFov(cam, fovy);
+                    sceneEdited = true;
+                }
+                if (ImGui::SliderFloat("Aperture", &cam.aperture, 0.0f, 0.6f, "%.3f"))
+                {
+                    sceneEdited = true;             // depth of field
+                }
+                if (ImGui::SliderFloat("Focus distance", &cam.focalDistance, 0.05f, 80.0f, "%.2f"))
+                {
+                    sceneEdited = true;
+                }
+
+                float lookAt[3] = { cam.lookAt.x, cam.lookAt.y, cam.lookAt.z };
+                if (ImGui::DragFloat3("Look at", lookAt, 0.02f))
+                {
+                    cam.lookAt = glm::vec3(lookAt[0], lookAt[1], lookAt[2]);
+                    camchanged = true;
+                    sceneEdited = true;
+                }
+                if (ImGui::SliderFloat("Distance", &zoom, 0.1f, 80.0f, "%.2f"))
+                {
+                    camchanged = true;
+                }
+                float azimuth = glm::degrees(phi);
+                float polar = glm::degrees(theta);
+                if (ImGui::SliderFloat("Azimuth (deg)", &azimuth, -180.0f, 180.0f, "%.0f"))
+                {
+                    phi = glm::radians(azimuth);
+                    camchanged = true;
+                }
+                if (ImGui::SliderFloat("Polar angle (deg)", &polar, 1.0f, 179.0f, "%.0f"))
+                {
+                    theta = glm::radians(polar);
+                    camchanged = true;
+                }
+
+                if (ImGui::Button("Reset camera"))
+                {
+                    renderState->camera = homeCamera;
+                    orbitFromCamera(homeCamera, ogLookAt, zoom, theta, phi);
+                    camchanged = true;
+                    sceneEdited = true;
+                }
+                ImGui::SameLine();
+                ImGui::Text("eye %.2f %.2f %.2f", cam.position.x, cam.position.y, cam.position.z);
+            }
+
+            if (ImGui::CollapsingHeader("Area lights (emitters)", ImGuiTreeNodeFlags_DefaultOpen))
+            {
+                if (panelLightIds.empty())
+                {
+                    ImGui::TextUnformatted("no emitter in this scene");
+                }
+                for (size_t row = 0; row < panelLightIds.size(); row++)
+                {
+                    const int id = panelLightIds[row];
+                    if (id < 0 || id >= (int)scene->materials.size()) { continue; }
+
+                    Material& material = scene->materials[id];
+                    const char* name = id < (int)scene->materialNames.size()
+                        ? scene->materialNames[id].c_str() : "material";
+                    ImGui::PushID(id);
+                    if (material.emittance > 0.0f)
+                    {
+                        ImGui::TextUnformatted(name);
+                    }
+                    else
+                    {
+                        ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.55f, 1.0f), "%s (off)", name);
+                    }
+                    if (ImGui::SliderFloat("emission", &material.emittance, 0.0f, 40.0f, "%.2f"))
+                    {
+                        sceneEdited = true;
+                    }
+                    if (ImGui::ColorEdit3("colour", &material.color.x,
+                            ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR))
+                    {
+                        sceneEdited = true;
+                    }
+                    ImGui::Separator();
+                    ImGui::PopID();
+                }
+                ImGui::TextUnformatted("emission 0 takes that light out of the scene");
+            }
+
+            if (ImGui::CollapsingHeader("Sky (dome)"))
+            {
+                Environment& env = renderState->environment;
+                const bool edited =
+                    ImGui::ColorEdit3("zenith", &env.zenith.x,
+                        ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR)
+                    | ImGui::ColorEdit3("horizon", &env.horizon.x,
+                        ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR)
+                    | ImGui::ColorEdit3("ground", &env.ground.x,
+                        ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR)
+                    | ImGui::SliderFloat("intensity", &env.intensity, 0.0f, 5.0f, "%.2f");
+                if (edited)
+                {
+                    sceneEdited = true;
+                }
+                ImGui::TextUnformatted("a black sky is no environment light");
+            }
+
+            if (ImGui::CollapsingHeader("Sun (distant light)"))
+            {
+                DistantLight& sun = renderState->distantLight;
+                bool enabled = sun.enabled != 0;
+                float elevation = 0.0f;
+                float azimuth = 0.0f;
+                sunAngles(sun.direction, elevation, azimuth);
+                float radiusDegrees = glm::degrees(
+                    glm::acos(glm::clamp(sun.cosMaxAngle, -1.0f, 1.0f)));
+
+                bool edited = false;
+                if (ImGui::Checkbox("enabled", &enabled)) { edited = true; }
+                edited |= ImGui::SliderFloat("elevation (deg)", &elevation, -89.0f, 89.0f, "%.0f");
+                edited |= ImGui::SliderFloat("azimuth (deg)", &azimuth, -180.0f, 180.0f, "%.0f");
+                edited |= ImGui::ColorEdit3("radiance", &sun.radiance.x,
+                    ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+                edited |= ImGui::SliderFloat("angular radius (deg)", &radiusDegrees, 0.01f, 45.0f,
+                    "%.2f");
+                if (edited)
+                {
+                    sun.enabled = enabled ? 1 : 0;
+                    sun.direction = sunDirection(elevation, azimuth);
+                    const float cosMax = glm::cos(glm::radians(glm::clamp(radiusDegrees,
+                        0.01f, 89.0f)));
+                    sun.cosMaxAngle = cosMax;
+                    sun.solidAngle = 2.0f * PI * (1.0f - cosMax);
+                    sceneEdited = true;
+                }
+                ImGui::Text("solid angle %.5g sr", sun.solidAngle);
+            }
+        }
+        ImGui::End();
+    }
+
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -568,12 +781,13 @@ int main(int argc, char** argv)
         cameraPosition = cam.position;
 
         // The interactive camera is an orbit camera
-        ogLookAt = cam.lookAt;
-        glm::vec3 eyeOffset = cam.position - ogLookAt;
-        zoom = glm::length(eyeOffset);
-        glm::vec3 forward = -eyeOffset / zoom;   // unit vector eye -> look-at
-        theta = glm::acos(glm::clamp(-forward.y, -1.0f, 1.0f));
-        phi = glm::atan(-forward.x, -forward.z);
+        orbitFromCamera(cam, ogLookAt, zoom, theta, phi);
+
+        // What the panel starts from, and what Reset camera goes back to
+        homeCamera = cam;
+        captureEmitters(scene);
+        guiData->TracedDepth = renderState->traceDepth;
+        sceneNeedsFullInit = true;
     }
 
     // Initialize CUDA and GL components
@@ -657,7 +871,16 @@ void runCuda()
     {
         return;                     // nothing loaded yet: the GUI is all there is
     }
-    if (renderFinished)
+    if (sceneEdited)
+    {
+        // The panel changed something: throw the accumulation away and start again,
+        // with whatever the edit needs refreshed below.
+        sceneEdited = false;
+        iteration = 0;
+        renderActive = true;
+        renderFinished = false;
+    }
+    else if (renderFinished)
     {
         if (!camchanged)
         {
@@ -696,27 +919,40 @@ void runCuda()
     // Map OpenGL buffer object for writing from CUDA on a single GPU
     if (iteration == 0)
     {
-        pathtraceFree();
-        pathtraceInit(scene);
+        if (sceneNeedsFullInit)
+        {
+            // First frame of a scene: allocate everything, and pick up a checkpoint
+            // if one matches this exact scene
+            pathtraceFree();
+            pathtraceInit(scene);
+            sceneNeedsFullInit = false;
 
-        // Restartable rendering handler
-        int resumedIterations = 0;
-        if (pathtraceLoadCheckpoint(scene, &resumedIterations))
-        {
-            iteration = resumedIterations;
+            // Restartable rendering handler
+            int resumedIterations = 0;
+            if (pathtraceLoadCheckpoint(scene, &resumedIterations))
+            {
+                iteration = resumedIterations;
+            }
+            else if (renderState->checkpointInterval > 0.0f)
+            {
+                printf("[checkpoint] writing %s.ckpt every %.1f s; stop and re-run the same "
+                    "scene to continue where it stopped\n",
+                    renderState->imageName.c_str(), renderState->checkpointInterval);
+            }
+            lastCheckpointTime = glfwGetTime();
+            lastFrameTime = glfwGetTime();
+            if (renderState->frameInterval > 0.0f)
+            {
+                printf("[frames] writing one image every %.1f s; the file name carries the sample "
+                    "count it had reached\n", renderState->frameInterval);
+            }
         }
-        else if (renderState->checkpointInterval > 0.0f)
+        else
         {
-            printf("[checkpoint] writing %s.ckpt every %.1f s; stop and re-run the same "
-                "scene to continue where it stopped\n",
-                renderState->imageName.c_str(), renderState->checkpointInterval);
-        }
-        lastCheckpointTime = glfwGetTime();
-        lastFrameTime = glfwGetTime();
-        if (renderState->frameInterval > 0.0f)
-        {
-            printf("[frames] writing one image every %.1f s; the file name carries the sample "
-                "count it had reached\n", renderState->frameInterval);
+            // A camera move or a panel edit: only the accumulation and the data the
+            // kernels read from device memory have to be refreshed, so the geometry
+            // and the hierarchy are left alone
+            pathtraceRestart(scene);
         }
     }
 

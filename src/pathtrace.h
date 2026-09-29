@@ -18,6 +18,10 @@ void pathtraceFetchImage(Scene* scene);
 // Copy the denoiser guides back to scene->state.normalImage / albedoImage
 void pathtraceFetchDenoiseGuides(Scene* scene);
 
+// Clear the accumulation buffer and reset the iteration count to 0
+// Leave the buffer in device memory allocated
+void pathtraceRestart(Scene* scene);
+
 // Write "<imageName>.ckpt" holding the accumulation buffer and the header
 bool pathtraceSaveCheckpoint(Scene* scene, int iterationsDone);
 

@@ -162,6 +162,7 @@ void Scene::loadFromJSON(const std::string& jsonName)
         newMaterial.textureScale = p.value("TEXSCALE", 1.0f);
 
         MatNameToID[name] = materials.size();
+        materialNames.push_back(name);
         materials.emplace_back(newMaterial);
     }
     const auto& objectsData = data["Objects"];

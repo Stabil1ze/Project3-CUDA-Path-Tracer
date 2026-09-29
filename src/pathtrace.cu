@@ -187,6 +187,83 @@ void InitDataContainer(GuiDataContainer* imGuiData)
     guiData = imGuiData;
 }
 
+// One DeviceLight per emitting primitive
+static void buildLightList(const Scene* scene, bool report)
+{
+    if (dev_lights != NULL)
+    {
+        cudaFree(dev_lights);       // a rebuild may drop an emitter altogether
+        dev_lights = NULL;
+    }
+
+    std::vector<DeviceLight> lights;
+    h_totalLightArea = 0.0f;
+    for (const Geom& geom : scene->geoms)
+    {
+        const Material& material = scene->materials[geom.materialid];
+        if (material.emittance <= 0.0f) { continue; }
+
+        DeviceLight light;
+        light.boundsMin = glm::vec3(FLT_MAX);
+        light.boundsMax = glm::vec3(-FLT_MAX);
+        for (int corner = 0; corner < 8; corner++)
+        {
+            glm::vec3 unit((corner & 1) ? 0.5f : -0.5f, (corner & 2) ? 0.5f : -0.5f,
+                (corner & 4) ? 0.5f : -0.5f);
+            glm::vec3 world = multiplyMV(geom.transform, glm::vec4(unit, 1.0f));
+            light.boundsMin = glm::min(light.boundsMin, world);
+            light.boundsMax = glm::max(light.boundsMax, world);
+        }
+        glm::vec3 size = light.boundsMax - light.boundsMin;
+        light.surfaceArea = 2.0f * (size.x * size.y + size.x * size.z + size.y * size.z);
+        light.emission = material.color * material.emittance;
+        light.geomIndex = (int)(&geom - scene->geoms.data());
+        light.shape = LIGHT_BOX;
+        light.radius = 0.0f;
+        light.center = 0.5f * (light.boundsMin + light.boundsMax);
+
+        if (geom.type == SPHERE)
+        {
+            const glm::vec3& s = geom.scale;
+            const float biggest = glm::max(s.x, glm::max(s.y, s.z));
+            const float smallest = glm::min(s.x, glm::min(s.y, s.z));
+            if (biggest - smallest <= 1e-4f * glm::max(biggest, 1e-6f))
+            {
+                light.shape = LIGHT_SPHERE;
+                light.radius = 0.5f * biggest;
+                light.surfaceArea = 4.0f * PI * light.radius * light.radius;
+            }
+            else if (report)
+            {
+                printf("[lights] warning: sphere emitter %d is scaled (%g %g %g), i.e. an "
+                    "ellipsoid; sampling it as a box\n", light.geomIndex, s.x, s.y, s.z);
+            }
+        }
+
+        if (light.shape == LIGHT_SPHERE && report)
+        {
+            printf("[lights] emitter %d is a sphere of radius %.4g at (%.3g %.3g %.3g)\n",
+                light.geomIndex, light.radius, light.center.x, light.center.y, light.center.z);
+        }
+        h_totalLightArea += light.surfaceArea;
+        lights.push_back(light);
+    }
+
+    h_lightCount = (int)lights.size();
+    h_lightInfo = lights;   // host side copy, for the ledger printout
+    if (h_lightCount > 0)
+    {
+        cudaMalloc(&dev_lights, h_lightCount * sizeof(DeviceLight));
+        cudaMemcpy(dev_lights, lights.data(), h_lightCount * sizeof(DeviceLight),
+            cudaMemcpyHostToDevice);
+        if (report)
+        {
+            printf("[lights] %d emitter(s), %.2f units^2 of emitting surface\n",
+                h_lightCount, h_totalLightArea);
+        }
+    }
+}
+
 void pathtraceInit(Scene* scene)
 {
     hst_scene = scene;
@@ -258,107 +335,82 @@ void pathtraceInit(Scene* scene)
     h_materialKeys.assign(pixelcount, 0);
 #endif
 
-    // Direct lighting: build the light list
-    std::vector<DeviceLight> lights;
-    h_totalLightArea = 0.0f;
-    for (const Geom& geom : scene->geoms)
-    {
-        const Material& material = scene->materials[geom.materialid];
-        if (material.emittance <= 0.0f) { continue; }
-
-        DeviceLight light;
-        light.boundsMin = glm::vec3(FLT_MAX);
-        light.boundsMax = glm::vec3(-FLT_MAX);
-        for (int corner = 0; corner < 8; corner++)
-        {
-            glm::vec3 unit((corner & 1) ? 0.5f : -0.5f, (corner & 2) ? 0.5f : -0.5f,
-                (corner & 4) ? 0.5f : -0.5f);
-            glm::vec3 world = multiplyMV(geom.transform, glm::vec4(unit, 1.0f));
-            light.boundsMin = glm::min(light.boundsMin, world);
-            light.boundsMax = glm::max(light.boundsMax, world);
-        }
-        glm::vec3 size = light.boundsMax - light.boundsMin;
-        light.surfaceArea = 2.0f * (size.x * size.y + size.x * size.z + size.y * size.z);
-        light.emission = material.color * material.emittance;
-        light.geomIndex = (int)(&geom - scene->geoms.data());
-        light.shape = LIGHT_BOX;
-        light.radius = 0.0f;
-        light.center = 0.5f * (light.boundsMin + light.boundsMax);
-
-        if (geom.type == SPHERE)
-        {
-            const glm::vec3& s = geom.scale;
-            const float biggest = glm::max(s.x, glm::max(s.y, s.z));
-            const float smallest = glm::min(s.x, glm::min(s.y, s.z));
-            if (biggest - smallest <= 1e-4f * glm::max(biggest, 1e-6f))
-            {
-                light.shape = LIGHT_SPHERE;
-                light.radius = 0.5f * biggest;
-                light.surfaceArea = 4.0f * PI * light.radius * light.radius;
-            }
-            else
-            {
-                printf("[lights] warning: sphere emitter %d is scaled (%g %g %g), i.e. an "
-                    "ellipsoid; sampling it as a box\n", light.geomIndex, s.x, s.y, s.z);
-            }
-        }
-
-        if (light.shape == LIGHT_SPHERE)
-        {
-            printf("[lights] emitter %d is a sphere of radius %.4g at (%.3g %.3g %.3g)\n",
-                light.geomIndex, light.radius, light.center.x, light.center.y, light.center.z);
-        }
-        h_totalLightArea += light.surfaceArea;
-        lights.push_back(light);
-    }
-
-    h_lightCount = (int)lights.size();
-    h_lightInfo = lights;   // host side copy, for the ledger printout
-    if (h_lightCount > 0)
-    {
-        cudaMalloc(&dev_lights, h_lightCount * sizeof(DeviceLight));
-        cudaMemcpy(dev_lights, lights.data(), h_lightCount * sizeof(DeviceLight),
-            cudaMemcpyHostToDevice);
-        printf("[lights] %d emitter(s), %.2f units^2 of emitting surface\n",
-            h_lightCount, h_totalLightArea);
-    }
+    // Direct lighting: one DeviceLight per emitting primitive
+    buildLightList(scene, true);
     // The instrumentation owns its counters; it needs the light count for the ledger.
     statsInit(h_lightCount);
 
     checkCUDAError("pathtraceInit");
 }
 
+// Restart the accumulation with the scene's current host data. The geometry, the
+// hierarchy and the buffers stay where they are; only the two things the kernels read
+// from device memory - the materials and the light list - are refreshed. Editing the
+// camera, the sky or the sun needs no upload at all: those are kernel arguments read
+// from the host at every launch.
+void pathtraceRestart(Scene* scene)
+{
+    hst_scene = scene;
+
+    const Camera& cam = scene->state.camera;
+    const int pixelcount = cam.resolution.x * cam.resolution.y;
+    cudaMemset(dev_image, 0, pixelcount * sizeof(glm::vec3));
+
+    if (!scene->materials.empty())
+    {
+        cudaMemcpy(dev_materials, scene->materials.data(),
+            scene->materials.size() * sizeof(Material), cudaMemcpyHostToDevice);
+    }
+    buildLightList(scene, false);
+
+    checkCUDAError("pathtraceRestart");
+}
+
+// Release every device buffer. This has to survive being called twice in a row: the
+// GUI frees the outgoing scene before deleting it and the full init on the next frame
+// frees again. A second cudaFree on a pointer that was already released is an error
+// rather than a no-op, so every pointer is cleared as it is freed.
 void pathtraceFree()
 {
-    cudaFree(dev_image);  // no-op if dev_image is null
+    cudaFree(dev_image);
+    dev_image = NULL;
     cudaFree(dev_paths);
+    dev_paths = NULL;
     cudaFree(dev_pathsAlt);
+    dev_pathsAlt = NULL;
     cudaFree(dev_geoms);
+    dev_geoms = NULL;
     cudaFree(dev_materials);
+    dev_materials = NULL;
     cudaFree(dev_intersections);
+    dev_intersections = NULL;
     cudaFree(dev_intersectionsAlt);
+    dev_intersectionsAlt = NULL;
     cudaFree(dev_alive);
+    dev_alive = NULL;
     cudaFree(dev_scanIndices);
+    dev_scanIndices = NULL;
     cudaFree(dev_bvhNodes);
-    cudaFree(dev_bvhPrimitiveIds);
-    cudaFree(dev_firstNormal);
-    cudaFree(dev_firstAlbedo);
-    dev_firstNormal = NULL;
-    dev_firstAlbedo = NULL;
     dev_bvhNodes = NULL;
+    cudaFree(dev_bvhPrimitiveIds);
     dev_bvhPrimitiveIds = NULL;
     h_bvhActive = false;
     h_bvhNodeCount = 0;
+    cudaFree(dev_firstNormal);
+    dev_firstNormal = NULL;
+    cudaFree(dev_firstAlbedo);
+    dev_firstAlbedo = NULL;
     cudaFree(dev_materialKeys);
-    cudaFree(dev_bucketCounts);
-    cudaFree(dev_bucketOffsets);
-    cudaFree(dev_bucketCursors);
     dev_materialKeys = NULL;
+    cudaFree(dev_bucketCounts);
     dev_bucketCounts = NULL;
+    cudaFree(dev_bucketOffsets);
     dev_bucketOffsets = NULL;
+    cudaFree(dev_bucketCursors);
     dev_bucketCursors = NULL;
-    cudaFree(dev_lights);   // no-op if the scene has no emitters
+    cudaFree(dev_lights);
     dev_lights = NULL;
+    h_lightCount = 0;
     statsFree();
     h_lightInfo.clear();
     checkpointRelease();
