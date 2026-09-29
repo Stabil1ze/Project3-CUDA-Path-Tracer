@@ -34,9 +34,7 @@ namespace
     }
 }
 
-/** Recursive binned SAH build. `first`/`count` is the range of `primitives` this
- *  node covers; the node is written before its children, so the array ends up in
- *  depth-first order and a child's index is known by the caller. */
+// Recursive binned SAH build
 static int buildNode(Bvh& bvh, std::vector<BuildPrimitive>& primitives, int first, int count,
     int depth)
 {
@@ -73,8 +71,7 @@ static int buildNode(Bvh& bvh, std::vector<BuildPrimitive>& primitives, int firs
         return nodeIndex;
     }
 
-    // Split along the axis the centroids are widest on, with the bins scored by
-    // the surface area heuristic: cost = area(left) * n(left) + area(right) * n(right).
+	// cost = surfaceArea(left) * leftCount + surfaceArea(right) * rightCount
     int axis = 0;
     if (centroidExtent.y > centroidExtent.x) axis = 1;
     if (centroidExtent.z > centroidExtent[axis]) axis = 2;
@@ -100,7 +97,7 @@ static int buildNode(Bvh& bvh, std::vector<BuildPrimitive>& primitives, int firs
         expand(binMin[bin], binMax[bin], primitive.boundsMax);
     }
 
-    // Sweep the bins once from each side to get the cost of every split plane.
+    // Sweep the bins once from each side to get the cost of every split plane
     float rightArea[BVH_SAH_BINS];
     int rightCount[BVH_SAH_BINS];
     glm::vec3 runningMin(FLT_MAX);
@@ -108,8 +105,7 @@ static int buildNode(Bvh& bvh, std::vector<BuildPrimitive>& primitives, int firs
     int running = 0;
     for (int b = BVH_SAH_BINS - 1; b >= 0; b--)
     {
-        // An empty bin must be skipped: its FLT_MAX sentinel minimum survives
-        // max() and makes the box infinite, and every cost with it
+		// Skip empty bins
         if (binCount[b] > 0)
         {
             expand(runningMin, runningMax, binMin[b]);
@@ -146,7 +142,7 @@ static int buildNode(Bvh& bvh, std::vector<BuildPrimitive>& primitives, int firs
         }
     }
 
-    // A leaf costs count * its own area; only split when the split is cheaper.
+    // A leaf costs count * its own area; only split when the split is cheaper
     const float leafCost = surfaceArea(nodeExtent(boundsMin, boundsMax)) * count;
     if (bestSplit < 0)
     {
@@ -167,9 +163,7 @@ static int buildNode(Bvh& bvh, std::vector<BuildPrimitive>& primitives, int firs
     const int leftCount = (int)(middle - begin);
     if (leftCount == 0 || leftCount == count || bestCost >= leafCost)
     {
-        // Degenerate partition, or a split that does not pay for itself: keep
-        // the geometry as one leaf. Both costs are in the same units - expected
-        // ray/primitive tests - so the comparison is the textbook one.
+		// The split was degenerate or not worth it; make a leaf instead
         bvh.nodes[nodeIndex].primitiveCount = count;
         bvh.leafCount++;
         bvh.leafPrimitives += count;
@@ -209,8 +203,8 @@ void buildBvh(const std::vector<Geom>& geoms, Bvh& bvh)
         bvh.primitiveIds.resize(primitives.size());
         bvh.nodes.reserve(2 * primitives.size() / BVH_LEAF_SIZE + 1);
         buildNode(bvh, primitives, 0, (int)primitives.size(), 0);
-        // The recursion partitions `primitives`, so the leaf order is the tree's
-        // order; write it back as the primitive index list the traversal reads.
+
+		// Recursively build the BVH and fill in the primitive IDs
         for (size_t i = 0; i < primitives.size(); i++)
         {
             bvh.primitiveIds[i] = primitives[i].id;

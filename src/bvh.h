@@ -7,16 +7,13 @@
 
 #include <vector>
 
-// Compile-time knobs so the write-up can quote a measurement for each; the
-// traversal stack is sized by the depth
+// Compile-time knobs so the write-up can quote a measurement for each
+// The traversal stack is sized by the depth
 #define BVH_LEAF_SIZE 4
 #define BVH_MAX_DEPTH 48
 #define BVH_SAH_BINS 16
 
-/** One node of the flattened BVH. The tree is built on the CPU (only the
- *  *traversal* has to be GPU side) and stored as an array, so the device side
- *  walks a stack of indices and no pointers. A leaf keeps a contiguous range of
- *  `primitiveIds`, an interior node the indices of its two children. */
+// One node per entry of `nodes`, with the children being indices into that array.=
 struct BvhNode
 {
     glm::vec3 boundsMin;
@@ -39,21 +36,13 @@ struct Bvh
     glm::vec3 boundsMax = glm::vec3(0.0f);
 };
 
-/** Build the hierarchy over every geometry in the scene, in place on the host:
- *  one primitive per entry of `geoms`, whatever kind it is (a mesh triangle is a
- *  primitive like any other). Splits use the surface area heuristic over 16 bins
- *  along the widest centroid axis, and only when a split beats a leaf. */
+// Build a bounding volume hierarchy for the given geometry
 void buildBvh(const std::vector<Geom>& geoms, Bvh& bvh);
 
-// --- Bounding volume hierarchy traversal -----------------------------------
-// The tree is built on the host (see bvh.cpp) and walked iteratively: recursion
-// on the device diverges and the stack is small, so the traversal carries its
-// own array of node indices, bounded by BVH_MAX_DEPTH.
+// Traversal stack size
 #define BVH_STACK_SIZE (BVH_MAX_DEPTH + 4)
 
-/** Slab test: does the ray reach this box no further away than `maxT`?
- *  `fminf`/`fmaxf` return the non-NaN operand, so a zero direction component
- *  (0 * inf) falls out of the arithmetic instead of needing a branch. */
+// Stack-based traversal of the BVH, returning the closest hit along the ray
 __device__ inline bool rayHitsBox(const glm::vec3& boundsMin, const glm::vec3& boundsMax,
     const glm::vec3& origin, const glm::vec3& inverseDirection, float maxT, float& entryDistance)
 {
@@ -69,9 +58,7 @@ __device__ inline bool rayHitsBox(const glm::vec3& boundsMin, const glm::vec3& b
     return exit >= entry;
 }
 
-/** Closest hit through the hierarchy; same contract as the flat loop. Children
- *  are visited nearest first so `bestT` tightens early and the far subtrees are
- *  cut by the slab test instead of being traversed. */
+// Closest hit along the ray, with the same early out the flat loop has
 __device__ inline bool bvhClosestHit(
     const BvhNode* nodes,
     const Geom* geoms,
@@ -138,20 +125,14 @@ __device__ inline bool bvhClosestHit(
             stack[top++] = nearFirst ? node.rightChild : node.leftChild;
             stack[top++] = nearFirst ? node.leftChild : node.rightChild;
         }
-        else if (hitLeft)
-        {
-            stack[top++] = node.leftChild;
-        }
-        else if (hitRight)
-        {
-            stack[top++] = node.rightChild;
-        }
+        else if (hitLeft) { stack[top++] = node.leftChild; }
+        else if (hitRight) { stack[top++] = node.rightChild; }
     }
 
     return bestT < FLT_MAX;
 }
 
-/** Any hit along the shadow ray, with the same early out the flat loop has. */
+// Any hit along the shadow ray, with the same early out the flat loop has
 __device__ inline bool bvhOccluded(const BvhNode* nodes, const Geom* geoms,
     const int* primitiveIds, Ray shadow, float maxT, int skipGeom)
 {
@@ -175,17 +156,11 @@ __device__ inline bool bvhOccluded(const BvhNode* nodes, const Geom* geoms,
             for (int i = 0; i < node.primitiveCount; i++)
             {
                 const int id = primitiveIds[node.firstPrimitive + i];
-                if (id == skipGeom)
-                {
-                    continue;
-                }
+                if (id == skipGeom) { continue; }
                 glm::vec3 point, normal;
                 bool outside = true;
                 const float t = intersectGeom(geoms[id], shadow, point, normal, outside);
-                if (t > 1e-4f && t < maxT)
-                {
-                    return true;
-                }
+                if (t > 1e-4f && t < maxT) { return true; }
             }
             continue;
         }
@@ -197,9 +172,7 @@ __device__ inline bool bvhOccluded(const BvhNode* nodes, const Geom* geoms,
     return false;
 }
 
-/** Is the segment from `origin` along `direction` (up to `maxT`) blocked?
- *  `bvhNodes` NULL falls back to the flat loop, which is also the reference the
- *  BVH has to match - both paths share `intersectGeom` and the same epsilon. */
+// Helper function for determining whether a point is occluded from a light source
 __device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3 origin,
     glm::vec3 direction, float maxT, int skipGeom,
     const BvhNode* bvhNodes = NULL, const int* bvhPrimitiveIds = NULL)
@@ -213,20 +186,14 @@ __device__ inline bool isOccluded(Geom* geoms, int geomCount, glm::vec3 origin,
     }
     for (int i = 0; i < geomCount; i++)
     {
-        if (i == skipGeom)
-        {
-            // Never let a light shadow itself: a sampled point is behind its own
-            // silhouette for oblique views, which would reject valid samples
-            continue;
-        }
+        if (i == skipGeom) { continue; }
+
         Geom& geom = geoms[i];
         glm::vec3 p, n;
         bool outside = true;
         const float t = intersectGeom(geom, shadow, p, n, outside);
-        if (t > 1e-4f && t < maxT)
-        {
-            return true;
-        }
+
+        if (t > 1e-4f && t < maxT) { return true; }
     }
     return false;
 }

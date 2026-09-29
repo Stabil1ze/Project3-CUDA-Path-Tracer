@@ -259,7 +259,7 @@ void InitImguiData(GuiDataContainer* guiData)
 }
 
 
-// LOOK: Un-Comment to check ImGui Usage
+// Main GUI rendering loop
 void RenderImGui()
 {
     mouseOverImGuiWinow = io->WantCaptureMouse;
@@ -369,11 +369,7 @@ int main(int argc, char** argv)
 
     cameraPosition = cam.position;
 
-    // The interactive camera is an orbit camera: runCuda() places the eye at
-    // lookAt + zoom * (sin(phi)*sin(theta), cos(theta), cos(phi)*sin(theta)), so
-    // the angles and the distance have to be recovered by inverting exactly that
-    // expression. Recovering theta from |view.y| instead of view.y would mirror
-    // the camera vertically whenever the scene looks downwards.
+    // The interactive camera is an orbit camera
     ogLookAt = cam.lookAt;
     glm::vec3 eyeOffset = cam.position - ogLookAt;
     zoom = glm::length(eyeOffset);
@@ -396,12 +392,10 @@ int main(int argc, char** argv)
 
 void saveImage()
 {
-    // The accumulation buffer lives on the device; pull it down now instead of
-    // copying it after every iteration (see pathtraceFetchImage).
+	// Get the image from the GPU
     pathtraceFetchImage(scene);
 
     float samples = iteration;
-    // output image file
     Image img(width, height);
 
     for (int x = 0; x < width; x++)
@@ -419,13 +413,9 @@ void saveImage()
     ss << filename << "." << startTimeString << "." << samples << "samp";
     filename = ss.str();
 
-    // CHECKITOUT
-    img.savePNG(filename);
-    //img.saveHDR(filename);  // Save a Radiance HDR file
+    img.savePNG(filename); 
 
-    // Denoise the same buffer and save it next to the raw one, so the two can be
-    // compared directly. The input is the linear mean radiance (not the clamped
-    // 8 bit image), and the guides are the first hit's normal and albedo.
+    // Denoise the same buffer and save it next to the raw one
     if (denoiserAvailable())
     {
         const int pixelcount = width * height;
@@ -449,7 +439,7 @@ void saveImage()
                     denoisedImage.setPixel(width - 1 - x, y, glm::vec3(denoised[x + y * width]));
                 }
             }
-            // savePNG appends ".png" itself.
+            // savePNG appends ".png" itself
             const std::string denoisedName = filename + ".denoised";
             denoisedImage.savePNG(denoisedName);
             printf("[oidn] \"%s\" denoised in %.0f ms on \"%s\" (normal + albedo guides)\n",
@@ -474,9 +464,7 @@ void runCuda()
 
         cam.view = -glm::normalize(cameraPosition);
         glm::vec3 v = cam.view;
-        glm::vec3 u = glm::vec3(0, 1, 0);//glm::normalize(cam.up);
-        // Orthonormal frame: a non-normalised `right` would shrink the
-        // horizontal field of view as soon as the camera is tilted.
+        glm::vec3 u = glm::vec3(0, 1, 0);
         glm::vec3 r = glm::normalize(glm::cross(v, u));
         cam.up = glm::cross(r, v);
         cam.right = r;
@@ -488,16 +476,12 @@ void runCuda()
     }
 
     // Map OpenGL buffer object for writing from CUDA on a single GPU
-    // No data is moved (Win & Linux). When mapped to CUDA, OpenGL should not use this buffer
-
     if (iteration == 0)
     {
         pathtraceFree();
         pathtraceInit(scene);
 
-        // Restartable rendering: pick up where the last run of this scene
-        // stopped. The checkpoint is validated against a fingerprint of the
-        // scene, so editing the scene file (or its resolution) starts over.
+        // Restartable rendering handler
         int resumedIterations = 0;
         if (pathtraceLoadCheckpoint(scene, &resumedIterations))
         {
@@ -531,9 +515,7 @@ void runCuda()
         // unmap buffer object
         cudaGLUnmapBufferObject(pbo);
 
-        // Restartable rendering: save every checkpointInterval seconds, so a
-        // render that takes hours survives a reboot. It is a scene field because
-        // it is really an I/O budget: 0 turns it off entirely.
+        // Restartable rendering handler
         const float interval = renderState->checkpointInterval;
         if (interval > 0.0f && iteration < renderState->iterations)
         {

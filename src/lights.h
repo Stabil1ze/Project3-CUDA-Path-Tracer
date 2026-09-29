@@ -60,7 +60,7 @@ struct LightLedger
 
 static const int LIGHT_SAMPLE_FACES = 6;
 
-/** Record one light sample outcome in a ledger row. */
+// Record one light sample outcome in a ledger row
 __device__ inline void ledgerRecord(LightLedger& row, LightSampleOutcome outcome, double energy)
 {
     atomicAdd(&row.samples, 1ull);
@@ -90,8 +90,7 @@ __device__ inline void ledgerRecord(LightLedger& row, LightSampleOutcome outcome
     }
 }
 
-/** Record an emitter hit reached by a random walk, with its MIS weight. A
- *  `weight` of 1 (delta sample, or light sampling off) is the reference side. */
+// Record an emitter hit reached by a random walk with its MIS weight
 __device__ inline void ledgerRecordBsdfHit(LightLedger& row, double energy,
     double weight)
 {
@@ -101,7 +100,7 @@ __device__ inline void ledgerRecordBsdfHit(LightLedger& row, double energy,
     atomicAdd(&row.bsdfEnergySq, energy * energy);
 }
 
-/** A direction uniform in solid angle over the cone of half angle `cosMax`. */
+// A direction uniform in solid angle over the cone of half angle `cosMax`
 __host__ __device__ inline glm::vec3 sampleCone(glm::vec3 axis, float cosMax, float u1, float u2)
 {
     const float cosTheta = glm::mix(cosMax, 1.0f, u1);
@@ -113,29 +112,26 @@ __host__ __device__ inline glm::vec3 sampleCone(glm::vec3 axis, float cosMax, fl
         + axis * cosTheta);
 }
 
-/** Solid angle density of the light strategy for a direction that reaches
- *  `light`, including the chance of having picked it. One definition shared by
- *  the estimator and the MIS weights, which must not drift apart. */
+// Solid angle density of the light strategy for a direction that reaches light
 __host__ __device__ inline float lightSampleSolidAnglePdf(const DeviceLight& light, int lightCount,
     glm::vec3 shadingPoint, glm::vec3 lightPoint, glm::vec3 lightNormal)
 {
     if (light.shape == LIGHT_SPHERE)
     {
-        // Uniform over the tangent cone: constant density on the visible cap, so
-        // no 1/cos singularity and no wasted samples on the far side.
+        // Uniform over the tangent cone
         const glm::vec3 toCenter = light.center - shadingPoint;
         const float distance2 = glm::dot(toCenter, toCenter);
         const float radius2 = light.radius * light.radius;
-        if (distance2 <= radius2)
-        {
-            return 0.0f;                 // inside the emitter: no visible cap
-        }
+
+        // inside the emitter: no visible cap
+        if (distance2 <= radius2) { return 0.0f; }
+
         const float cosMax = sqrtf(glm::max(0.0f, 1.0f - radius2 / distance2));
         const float solidAngle = TWO_PI * (1.0f - cosMax);
         return 1.0f / glm::max((float)lightCount * solidAngle, 1e-12f);
     }
 
-    // Box: uniform by area, converted to the solid angle the BSDF lives in.
+    // Box: uniform by area, converted to the solid angle the BSDF lives in
     const glm::vec3 toLight = lightPoint - shadingPoint;
     const float distance2 = glm::dot(toLight, toLight);
     const float cosLight = glm::abs(glm::dot(lightNormal, glm::normalize(-toLight)));
@@ -143,7 +139,7 @@ __host__ __device__ inline float lightSampleSolidAnglePdf(const DeviceLight& lig
         * distance2 / glm::max(cosLight, 1e-4f);
 }
 
-/** Same, for a hit that has to be attributed to one of the lights by geometry. */
+// Same, for a hit that has to be attributed to one of the lights by geometry
 __host__ __device__ inline float lightSamplePdfForGeom(const DeviceLight* lights, int lightCount,
     glm::vec3 shadingPoint, glm::vec3 lightPoint, glm::vec3 lightNormal, int geomId)
 {
@@ -158,9 +154,7 @@ __host__ __device__ inline float lightSamplePdfForGeom(const DeviceLight* lights
     return 0.0f;
 }
 
-/** Sample a point on a random light: uniform by area over the six faces of a box
- *  or over the tangent cone of a sphere. Always consumes four random numbers so
- *  that every sample uses the same dimension budget. */
+// Sample a point on a random light
 __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, int lightCount,
     glm::vec3 shadingPoint, float u0, float u1, float u2, float u3,
     glm::vec3& point, glm::vec3& normal, glm::vec3& emission, int& geomIndex,
@@ -185,8 +179,8 @@ __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, in
         const glm::vec3 axis = toCenter * glm::inversesqrt(distance2);
         const float cosMax = sqrtf(glm::max(0.0f, 1.0f - radius2 / distance2));
         const glm::vec3 wi = sampleCone(axis, cosMax, u2, u3);
-        // Nearest intersection of that direction with the sphere: the sample
-        // point, and the normal the emitter radiates along.
+
+        // Nearest intersection of that direction with the sphere
         const float b = glm::dot(wi, toCenter);
         const float disc = b * b - (distance2 - radius2);
         if (disc <= 0.0f)
@@ -259,11 +253,11 @@ __host__ __device__ inline bool sampleLightSurface(const DeviceLight* lights, in
     return true;
 }
 
-// --- Multiple importance sampling -----------------------------------------
+// --------------------------------------------
+// MIS Part
+// --------------------------------------------
 
-/** Radiance of the environment light (the dome): a three colour sky, blended at
- *  the horizon. Escaping rays collect it, so it needs no second sampling
- *  strategy (see the README). */
+// Radiance of the environment in a direction
 __host__ __device__ inline glm::vec3 environmentRadiance(const Environment& environment,
     glm::vec3 direction)
 {
@@ -274,23 +268,19 @@ __host__ __device__ inline glm::vec3 environmentRadiance(const Environment& envi
     return environment.intensity * radiance;
 }
 
-// --- The distant light (a sun) ---------------------------------------------
-
-/** Is this direction inside the distant light's disc? */
+// Helper to check if a direction is inside the distant light's cone of influence
 __host__ __device__ inline bool insideDistantLight(const DistantLight& sun, glm::vec3 direction)
 {
     return sun.enabled != 0 && glm::dot(direction, -sun.direction) >= sun.cosMaxAngle;
 }
 
-/** Density of the distant light's sampler: uniform over its disc, zero
- *  elsewhere. The zero is what keeps MIS well behaved outside the disc. */
+// Density of the distant light for a direction, uniform over the cone of influence
 __host__ __device__ inline float distantLightPdf(const DistantLight& sun, glm::vec3 direction)
 {
     return insideDistantLight(sun, direction) ? (1.0f / glm::max(sun.solidAngle, 1e-12f)) : 0.0f;
 }
 
-/** A direction uniformly distributed over the disc's cone (uniform in solid
- *  angle, which is what makes the density above a constant). */
+// Sample a direction uniform in solid angle over the distant light's cone of influence
 __host__ __device__ inline glm::vec3 sampleDistantLight(const DistantLight& sun, float u1, float u2)
 {
     const glm::vec3 axis = -sun.direction;              // towards the light
@@ -303,32 +293,25 @@ __host__ __device__ inline glm::vec3 sampleDistantLight(const DistantLight& sun,
         + axis * cosTheta);
 }
 
-/** How often the light strategy picks the distant light over an area light: a
- *  fixed half when a scene has both, all of it when it has one. MIS keeps either
- *  choice unbiased; power weighted selection is the refinement. */
+// How often the distant light is chosen in a mixed strategy with area lights
 __host__ __device__ inline float distantLightSelectionChance(const DistantLight& sun,
     int lightCount, float totalLightArea)
 {
     const bool areaLights = (lightCount > 0 && totalLightArea > 0.0f);
     const bool distant = sun.enabled != 0;
-    if (distant && areaLights)
-    {
-        return 0.5f;
-    }
+    if (distant && areaLights) { return 0.5f; }
     return distant ? 1.0f : 0.0f;
 }
 
-/** Density of the light strategy family (area lights + the sun) for a direction.
- *  `areaDensity` is the caller's area light density, 0 for a direction that
- *  leaves the scene. */
+// Density of the mixed light strategy for a direction that reaches light
 __host__ __device__ inline float lightStrategyPdf(const DistantLight& sun, float sunChance,
     float areaDensity, glm::vec3 direction)
 {
     return (1.0f - sunChance) * areaDensity + sunChance * distantLightPdf(sun, direction);
 }
 
-/** Power heuristic (beta = 2) MIS weight: w = a^2 / (a^2 + b^2). Squaring makes
- *  the better strategy win faster than the balance heuristic. */
+// Power heuristic weight for two strategies with densities pdfA and pdfB
+// result = pdfA^2 / (pdfA^2 + pdfB^2), with a safe fallback for zero density
 __host__ __device__ inline float misWeight(float pdfThis, float pdfOther)
 {
     const float a = pdfThis * pdfThis;

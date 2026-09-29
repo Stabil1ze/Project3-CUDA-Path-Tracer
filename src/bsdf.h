@@ -131,7 +131,7 @@ __host__ __device__ inline void ggxLobeEval(glm::vec3 n, glm::vec3 wo, glm::vec3
     }
 }
 
-// Packer sampler result
+// Packed sampler result
 struct BsdfSample
 {
     glm::vec3 direction;   // world space

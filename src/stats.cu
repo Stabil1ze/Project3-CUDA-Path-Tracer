@@ -319,8 +319,7 @@ void statsInit(int lightCount)
 
 #if DIRECT_LIGHT_STATS
     {
-        // One row per area light, plus one for the distant light (not a geometry,
-        // so it gets the last row instead of an entry in the light list).
+        // One row per area light, plus one for the distant light
         cudaMalloc(&dev_lightLedger, (lightCount + 1) * sizeof(LightLedger));
         cudaMemset(dev_lightLedger, 0, (lightCount + 1) * sizeof(LightLedger));
         cudaMalloc(&dev_lightFaceLedger,

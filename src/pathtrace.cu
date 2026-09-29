@@ -139,9 +139,7 @@ static Material* dev_materials = NULL;
 static PathSegment* dev_paths = NULL;
 static ShadeableIntersection* dev_intersections = NULL;
 
-// Double buffers used by stream compaction: compaction scatters into the "alt"
-// arrays and the two pairs are swapped afterwards (scattering in place would
-// race, since element i moves to a slot another thread may not have read yet).
+// Double buffers used by stream compaction
 static PathSegment* dev_pathsAlt = NULL;
 static ShadeableIntersection* dev_intersectionsAlt = NULL;
 static int* dev_alive = NULL;          // predicate: 1 = keep, 0 = terminated
@@ -149,13 +147,13 @@ static int* dev_scanIndices = NULL;    // exclusive prefix sum of the predicate
 static int h_scanCapacity = 0;         // elements allocated for dev_scanIndices
 
 // Buffers for the material sort
-static int* dev_materialKeys = NULL;   // 0 = the ray escaped, otherwise 1 + material id
-static int* dev_bucketCounts = NULL;   // histogram of the keys
-static int* dev_bucketOffsets = NULL;  // exclusive prefix sum, i.e. run starts
-static int* dev_bucketCursors = NULL;  // the offsets again, bumped while scattering
-static int h_bucketCapacity = 0;       // elements allocated in each of the three above
+static int* dev_materialKeys = NULL; 
+static int* dev_bucketCounts = NULL;  
+static int* dev_bucketOffsets = NULL; 
+static int* dev_bucketCursors = NULL;  
+static int h_bucketCapacity = 0;      
 #if MATERIAL_SORT_STATS
-static std::vector<int> h_materialKeys;   // the keys, brought back for the analysis
+static std::vector<int> h_materialKeys;  
 #endif
 
 // The BVH acceleration structure
@@ -168,21 +166,11 @@ static bool h_bvhActive = false;
 static glm::vec3* dev_firstNormal = NULL;
 static glm::vec3* dev_firstAlbedo = NULL;
 
-// Per-bounce ray counts for analysis
-
-
-
-
-
 // Direct lighting instrumentation
-
 static DeviceLight* dev_lights = NULL;
 static std::vector<DeviceLight> h_lightInfo;   // same list, kept for the printout
 static int h_lightCount = 0;
 static float h_totalLightArea = 0.0f;
-
-
-
 
 static int nextPowerOfTwoAtLeast(int n)
 {
@@ -253,16 +241,14 @@ void pathtraceInit(Scene* scene)
             USE_BVH ? " (below the crossover)" : " (USE_BVH 0)");
     }
 
-    // Buffers for the stream compaction stage (see compactPaths below).
+    // Buffers for the stream compaction
     h_scanCapacity = nextPowerOfTwoAtLeast(pixelcount + 1);   // +1 so the scan also yields the total
     cudaMalloc(&dev_pathsAlt, pixelcount * sizeof(PathSegment));
     cudaMalloc(&dev_intersectionsAlt, pixelcount * sizeof(ShadeableIntersection));
     cudaMalloc(&dev_alive, pixelcount * sizeof(int));
     cudaMalloc(&dev_scanIndices, h_scanCapacity * sizeof(int));
 
-    // Buffers for the material sort (see sortPathsByMaterial below): one key per
-    // path plus the three per-material arrays - one bucket per material, plus
-    // one for the rays that escaped.
+    // Buffers for the material sort
     h_bucketCapacity = nextPowerOfTwoAtLeast((int)scene->materials.size() + 2);
     cudaMalloc(&dev_materialKeys, pixelcount * sizeof(int));
     cudaMalloc(&dev_bucketCounts, h_bucketCapacity * sizeof(int));
@@ -272,18 +258,14 @@ void pathtraceInit(Scene* scene)
     h_materialKeys.assign(pixelcount, 0);
 #endif
 
-    // --- Direct lighting: build the light list ---------------------------
-    // The unit box the base code intersects is [-0.5, 0.5]^3, so transforming
-    // its eight corners gives the world space extents of the emissive geometry.
+    // Direct lighting: build the light list
     std::vector<DeviceLight> lights;
     h_totalLightArea = 0.0f;
     for (const Geom& geom : scene->geoms)
     {
         const Material& material = scene->materials[geom.materialid];
-        if (material.emittance <= 0.0f)
-        {
-            continue;
-        }
+        if (material.emittance <= 0.0f) { continue; }
+
         DeviceLight light;
         light.boundsMin = glm::vec3(FLT_MAX);
         light.boundsMax = glm::vec3(-FLT_MAX);
@@ -299,12 +281,10 @@ void pathtraceInit(Scene* scene)
         light.surfaceArea = 2.0f * (size.x * size.y + size.x * size.z + size.y * size.z);
         light.emission = material.color * material.emittance;
         light.geomIndex = (int)(&geom - scene->geoms.data());
-        // A sphere is sampled over its tangent cone, so the world radius is half
-        // the scale; a non uniform scale is an ellipsoid and falls back to the
-        // box path with a warning instead of being sampled wrongly.
         light.shape = LIGHT_BOX;
         light.radius = 0.0f;
         light.center = 0.5f * (light.boundsMin + light.boundsMax);
+
         if (geom.type == SPHERE)
         {
             const glm::vec3& s = geom.scale;
@@ -322,6 +302,7 @@ void pathtraceInit(Scene* scene)
                     "ellipsoid; sampling it as a box\n", light.geomIndex, s.x, s.y, s.z);
             }
         }
+
         if (light.shape == LIGHT_SPHERE)
         {
             printf("[lights] emitter %d is a sphere of radius %.4g at (%.3g %.3g %.3g)\n",
@@ -440,10 +421,7 @@ void printCheckpointStats()
     checkpointPrintStats();
 }
 
-/**
- * Generate the first bounce: one camera ray per pixel, jittered inside the pixel
- * area (STOCHASTIC_AA) and, when the aperture is open, started on the lens disk.
- */
+// Generate the first bounce ray from the camera for each pixel
 __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, PathSegment* pathSegments)
 {
     int x = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -455,19 +433,13 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.color = glm::vec3(1.0f, 1.0f, 1.0f);
 
-        // Integer (x, y) addresses the *corner* of a pixel: at x = 0 the offset
-        // below is exactly -resolution.x * 0.5 pixel lengths, the left edge of
-        // the view, so the pixel area is [x, x + 1) x [y, y + 1).
         float sampleX = (float)x;
         float sampleY = (float)y;
 
-        // Depth tag -1 gives the camera ray its own RNG stream (bounce `d` draws
-        // with tag `d`); tag 0 would share numbers with the first scatter.
         constexpr int CAMERA_RNG_DEPTH = -1;
         thrust::default_random_engine rng =
             makeSeededRandomEngine(iter, index, CAMERA_RNG_DEPTH);
-        // The camera ray owns dimensions 0-3 of this sample: two for the pixel
-        // area, two for the lens. Everything after that belongs to the path.
+
         Sampler sampler((unsigned int)iter, (unsigned int)index, 0u);
 
 #if STOCHASTIC_AA // jitter the ray inside the pixel area
@@ -475,17 +447,13 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
         sampleY += nextRandom(rng, sampler);
 #endif
 
-        // Direction of the pinhole camera, i.e. the ray through the centre of
-        // the thin lens.
+        // Direction of the pinhole camera
         glm::vec3 pinholeDirection = glm::normalize(cam.view
             - cam.right * cam.pixelLength.x * (sampleX - (float)cam.resolution.x * 0.5f)
             - cam.up * cam.pixelLength.y * (sampleY - (float)cam.resolution.y * 0.5f)
         );
 
-        // --- Physically based depth of field (thin lens model) -------------
-        // Start the ray on the lens disk but aim it at the focal plane, so
-        // everything at `focalDistance` stays sharp and an out of focus point at
-        // distance z blurs by `aperture * |1/z - 1/focalDistance|`.
+        // Physically based depth of field
         if (cam.aperture > 0.0f && cam.focalDistance > 0.0f)
         {
             float radius = cam.aperture * sqrtf(nextRandom(rng, sampler));   // sqrt = uniform over the disk
@@ -506,8 +474,7 @@ __global__ void generateRayFromCamera(Camera cam, int iter, int traceDepth, Path
 
         segment.pixelIndex = index;
         segment.remainingBounces = traceDepth;
-        // No BSDF behind a camera ray: density 0 gives an emitter it hits the
-        // full weight (the value also marks a delta sample).
+        // No BSDF behind a camera ray
         segment.lastPdf = 0.0f;
     }
 }
@@ -530,9 +497,7 @@ __global__ void computeIntersections(
     {
         PathSegment pathSegment = pathSegments[path_index];
 
-        // Terminated paths (remainingBounces < 0) are skipped. Writing t = -1
-        // also guarantees a stale intersection from an earlier bounce can never
-        // be shaded a second time.
+        // Terminated paths are skipped
         if (pathSegment.remainingBounces < 0)
         {
             intersections[path_index].t = -1.0f;
@@ -617,11 +582,7 @@ __global__ void computeIntersections(
     }
 }
 
-// Shade one bounce of every live path segment: evaluate the BSDF (scatterRay),
-// which updates the throughput and writes the next ray.
-//
-// remainingBounces > 0: may scatter; == 0: out of scattering budget but may
-// still see an emitter; < 0: terminated - the stream compaction predicate.
+// Shade one bounce of every live path segment and evaluate the BSDF
 __global__ void shadeMaterials(
     int iter,
     int depth,
@@ -651,25 +612,16 @@ __global__ void shadeMaterials(
     glm::vec3* firstAlbedo)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_paths)
-    {
-        return;
-    }
+    if (idx >= num_paths) { return; }
 
     PathSegment& pathSegment = pathSegments[idx];
 
-    // Already terminated in an earlier bounce: nothing to do (this is the slot
-    // stream compaction will eventually remove from the arrays entirely).
-    if (pathSegment.remainingBounces < 0)
-    {
-        return;
-    }
+    // Already terminated in an earlier bounce: nothing to do
+    if (pathSegment.remainingBounces < 0) { return; }
 
     ShadeableIntersection intersection = shadeableIntersections[idx];
 
-    // (1) Ray escaped the scene: it sees the environment light (the dome), which
-    //     is the only way to find it - as background and as the light of an open
-    //     scene
+    // (1) Ray escaped the scene: it sees the environment light
     if (intersection.t <= 0.0f)
     {
         const glm::vec3 rayDirection = glm::normalize(pathSegment.ray.direction);
@@ -679,15 +631,16 @@ __global__ void shadeMaterials(
         if (insideDistantLight(distantLight, rayDirection))
         {
             float weight = 1.0f;
+
 #if DIRECT_LIGHT_SAMPLING
-            // With the estimator off the path sampler is the only strategy and
-            // keeps everything, or the "path sampling only" build would be dark.
+			// The light strategy's density for this direction, at this hit point
             const float sunChance = distantLightSelectionChance(distantLight, lightCount,
                 totalLightArea);
             const float lightDensity = lightStrategyPdf(distantLight, sunChance, 0.0f, rayDirection);
             const float bsdfDensity = pathSegment.lastPdf;
             weight = (bsdfDensity > 0.0f) ? misWeight(bsdfDensity, lightDensity) : 1.0f;
 #endif
+
             radiance += distantLight.radiance * weight;
         }
         if (radiance.x > 0.0f || radiance.y > 0.0f || radiance.z > 0.0f)
@@ -704,45 +657,47 @@ __global__ void shadeMaterials(
 
     Material material = materials[intersection.materialId];
 
-    // Denoiser guides: written at the first bounce only, and overwritten every
-    // iteration with the same value - they are a property of the geometry
+    // Denoiser guides
     if (depth == 0)
     {
         firstNormal[pathSegment.pixelIndex] = intersection.surfaceNormal;
         firstAlbedo[pathSegment.pixelIndex] = material.color;
     }
 
-    // (2) Ray hit an emitter: add the weighted emission to the pixel accumulator
-    //     and terminate. Accumulating here, not in a final gather over the path
-    //     array, is what lets compaction drop terminated paths.
+    // (2) Ray hit an emitter: add the weighted emission to the pixel accumulator and terminate
     if (material.emittance > 0.0f)
     {
         glm::vec3 contribution = pathSegment.color * material.color * material.emittance;
         // Two strategies found this light, so MIS weights the path's estimate by
         // how well it does here; a delta sample (lastPdf == 0) keeps full weight.
         float weight = 1.0f;
+
 #if DIRECT_LIGHT_SAMPLING
         if (pathSegment.lastPdf > 0.0f)
         {
             const glm::vec3 rayDirection = glm::normalize(pathSegment.ray.direction);
             const glm::vec3 hitPoint = pathSegment.ray.origin + intersection.t * rayDirection;
-            // The light strategy's density for this direction, at this hit point.
+
+            // The light strategy's density for this direction, at this hit point
             const float areaDensity = lightSamplePdfForGeom(lights, lightCount,
                 pathSegment.ray.origin, hitPoint, intersection.surfaceNormal, intersection.geomId);
             const float sunChance = distantLightSelectionChance(distantLight, lightCount,
                 totalLightArea);
             const float lightDensity = lightStrategyPdf(distantLight, sunChance, areaDensity,
                 rayDirection);
+
             if (lightDensity > 0.0f)
             {
                 weight = misWeight(pathSegment.lastPdf, lightDensity);
             }
         }
 #endif
+
         contribution *= weight;
         atomicAdd(&image[pathSegment.pixelIndex].x, contribution.x);
         atomicAdd(&image[pathSegment.pixelIndex].y, contribution.y);
         atomicAdd(&image[pathSegment.pixelIndex].z, contribution.z);
+
 #if DIRECT_LIGHT_SAMPLING && DIRECT_LIGHT_STATS
         {
             // Ledger: what this hit weighed, against a renderer without MIS.
@@ -777,13 +732,12 @@ __global__ void shadeMaterials(
             }
         }
 #endif
+
         pathSegment.remainingBounces = -1;
         return;
     }
 
-    // (3) Ray hit a normal surface but the path has no scattering budget left,
-    //     so the next ray would never be traced. Such a path cannot reach a
-    //     light any more -> zero contribution and terminate.
+    // (3) Ray hit a normal surface but the path has no scattering budget left, so the next ray would never be traced
     if (pathSegment.remainingBounces <= 0)
     {
         pathSegment.color = glm::vec3(0.0f);
@@ -791,13 +745,11 @@ __global__ void shadeMaterials(
         return;
     }
 
-    // World space point of the hit, needed both by the procedural texture below
-    // and by the scatter.
+    // World space point of the hit
     glm::vec3 intersect = pathSegment.ray.origin
         + intersection.t * glm::normalize(pathSegment.ray.direction);
 
-    // Procedural texture: the pattern is defined in object space, so map the hit
-    // point back there and modulate the albedo.
+    // Procedural texture
     if (material.textureType > 0 && intersection.geomId >= 0)
     {
         const Geom& geom = geoms[intersection.geomId];
@@ -807,11 +759,8 @@ __global__ void shadeMaterials(
         material.specular.color = material.color;
     }
 
-    // (4) Regular surface: evaluate the BSDF to update the throughput and
-    //     generate the next ray. Seeding by (iteration, pixel, depth) makes a
-    //     pixel's samples independent across iterations but reproducible.
-    thrust::default_random_engine rng =
-        makeSeededRandomEngine(iter, pathSegment.pixelIndex, depth);
+    // (4) Regular surface: evaluate the BSDF to update the throughput and generate the next ray
+    thrust::default_random_engine rng = makeSeededRandomEngine(iter, pathSegment.pixelIndex, depth);
     thrust::uniform_real_distribution<float> lightU01(0.0f, 1.0f);
 
     // Surface normal on the side the ray came from, as scatterRay sees it.
@@ -821,11 +770,12 @@ __global__ void shadeMaterials(
         normal = -normal;
     }
 
-    // --- Direct lighting (next event estimation) -------------------------
+    // Direct lighting  
     // Sample a point on a light, evaluate the BSDF towards it and reject it if
     // the segment is blocked. MIS folds in the path's own emitter hits, so only
     // a vertex with a non-delta lobe can take part.
     const bool connectableVertex = bsdfHasNonDeltaLobe(material);
+
 #if DIRECT_LIGHT_SAMPLING
     const bool areaLightsEnabled = (lightCount > 0 && totalLightArea > 0.0f);
     const float sunChance = distantLightSelectionChance(distantLight, lightCount, totalLightArea);
@@ -843,10 +793,7 @@ __global__ void shadeMaterials(
 
         if (lightChoice < sunChance)
         {
-            // --- The distant light: aim at the disc ------------------------
-            // Every sample lands on the disc, and an unblocked shadow ray also
-            // says the direction missed any area light, so both parts share one
-            // density.
+			// Sample the sun disc, evaluate the BSDF towards it and reject it if the segment is blocked
             const glm::vec3 wi = sampleDistantLight(distantLight, su0, su1);
             const float cosSurface = glm::dot(normal, wi);
             const float lightPdf = sunChance * distantLightPdf(distantLight, wi);
@@ -871,16 +818,18 @@ __global__ void shadeMaterials(
                     outcome = LIGHT_ACCEPTED;
                 }
             }
+
 #if DIRECT_LIGHT_STATS
             // The disc gets the extra ledger row (see pathtraceInit).
             ledgerRecord(lightLedger[lightCount], outcome, sampleEnergy);
 #else
             (void)sampleEnergy;
 #endif
+
         }
         else
         {
-        // --- The area lights: sample a point on the surface of one ---------
+			// Sample an area light, evaluate the BSDF towards it and reject it if the segment is blocked
         glm::vec3 lightPoint, lightNormal, lightEmission;
         int lightGeom = -1;
         int lightIndex = -1;
@@ -894,19 +843,16 @@ __global__ void shadeMaterials(
             const glm::vec3 wi = toLight / distance;
             const float cosSurface = glm::dot(normal, wi);
             const float cosLight = glm::dot(lightNormal, -wi);
-            // cosLight > 0 means the renderer can see this part of the light: a
-            // ray towards an away-facing face enters the box through a nearer
-            // one first
+
             LightSampleOutcome outcome = LIGHT_REJECT_COS_SURFACE;
             double sampleEnergy = 0.0;
-            if (cosSurface > 0.0f)
+			if (cosSurface > 0.0f) // The BSDF is zero if the light is behind the surface
             {
                 outcome = LIGHT_REJECT_COS_LIGHT;
                 if (cosLight > 0.0f)
                 {
                     outcome = LIGHT_REJECT_OCCLUDED;
-                    // Density for the whole strategy: the picked area light plus
-                    // the sun, whose disc may cover this direction too
+                    // Density for the whole strategy
                     const float areaDensity = lightSampleSolidAnglePdf(lights[lightIndex],
                         lightCount, intersect, lightPoint, lightNormal);
                     const float lightPdf = lightStrategyPdf(distantLight, sunChance, areaDensity, wi);
@@ -915,9 +861,6 @@ __global__ void shadeMaterials(
                     if (!isOccluded(geoms, geomCount, shadowOrigin, wi, distance - 1e-3f, shadowSkip,
                             bvhNodes, bvhPrimitiveIds))
                     {
-                        // The light strategy chose the direction; the BSDF density
-                        // is what the path would have produced for it - the other
-                        // half of the MIS weight.
                         const glm::vec3 wo = -glm::normalize(pathSegment.ray.direction);
                         float bsdfDensity = 0.0f;
                         const glm::vec3 f = bsdfEval(material, normal, wo, wi, bsdfDensity);
@@ -932,6 +875,7 @@ __global__ void shadeMaterials(
                     }
                 }
             }
+
 #if DIRECT_LIGHT_STATS
             ledgerRecord(lightLedger[lightIndex], outcome, sampleEnergy);
             ledgerRecord(lightFaceLedger[lightIndex * LIGHT_SAMPLE_FACES + lightFace],
@@ -939,9 +883,11 @@ __global__ void shadeMaterials(
 #else
             (void)sampleEnergy;
 #endif
+
         }
         }
     }
+
 #else
     (void)lightU01; (void)lightCount; (void)totalLightArea; (void)lights;
     (void)connectableVertex;
@@ -949,20 +895,13 @@ __global__ void shadeMaterials(
     (void)foldedAboveLedger;
     (void)foldedFaceLedger;
 #endif
-    // The low discrepancy sequence is deliberately *not* used for the path
-    // dimensions: measured, it made a 200 spp Cornell render worse (RMSE 34.6
-    // against 11.6 for random draws) - the known failure of a Halton sequence in
-    // an integral whose effective dimension changes from sample to sample. Only
-    // the pixel and lens dimensions, handled in generateRayFromCamera, use it.
 
+	// Scatter the ray into a new direction, update the throughput and the last PDF for the next vertex
     scatterRay(pathSegment, intersect, intersection.surfaceNormal,
         intersection.outside != 0, material, rng);
 
 #if RUSSIAN_ROULETTE
-    // --- Russian roulette ------------------------------------------------
-    // Survive with p = throughput and divide the survivors by p, which keeps the
-    // estimator unbiased: E[killed ? 0 : throughput / p] = throughput. A dim path
-    // then costs a full bounce only rarely.
+	// Russian roulette: terminate low-throughput paths with a probability
     if (depth >= RR_MIN_DEPTH)
     {
         const float throughput = glm::max(pathSegment.color.x,
@@ -993,8 +932,8 @@ __global__ void shadeMaterials(
     (void)rrSurvivalMilli;
 #endif
 
-    // The scattered ray carried its own density into the next vertex (see
-    // PathSegment::lastPdf), so there is nothing left to hand over here.
+    // The scattered ray carried its own density into the next vertex, 
+    // so there is nothing left to hand over here.
     pathSegment.remainingBounces--;
 }
 
@@ -1072,11 +1011,9 @@ static int compactPaths(
 }
 
 // ---------------------------------------------------------------------------
-// Sorting the paths by material (Part 1 core feature)
+// Sorting the paths by material
 // ---------------------------------------------------------------------------
 
-// Key of a path: 0 for a ray that hit nothing (those all take the same small
-// "sees the environment" branch), otherwise 1 + material id.
 #if SORT_BY_MATERIAL || MATERIAL_SORT_STATS
 __global__ void kernMaterialSortKeys(
     int n, const ShadeableIntersection* intersections, int materialCount, int* keys)
@@ -1092,6 +1029,7 @@ __global__ void kernMaterialSortKeys(
 #endif
 
 #if SORT_BY_MATERIAL
+
 // One counter per bucket. The bucket count is the number of materials, so a
 // plain atomic histogram over shared memory buys nothing at this size.
 __global__ void kernCountMaterials(int n, const int* keys, int* counts)
@@ -1103,9 +1041,7 @@ __global__ void kernCountMaterials(int n, const int* keys, int* counts)
     }
 }
 
-// Move every path into its material's run and take its intersection along. The
-// atomic cursor makes the order *inside* a run arbitrary, which is fine: a path
-// carries its own pixel index, RNG seed and throughput.
+// Move every path into its material's run and take its intersection along
 __global__ void kernScatterByMaterial(
     int n,
     PathSegment* paths,
@@ -1195,7 +1131,7 @@ static void reportMaterialMix(int numPaths, const ShadeableIntersection* interse
 #endif
 
 #if SORT_BY_MATERIAL
-/** Reorder (paths, intersections) so that the paths which hit the same material
+// Reorder paths and intersections so that the paths which hit the same material
  *  sit next to each other: a warp holding a mix of them runs the shading branches
  *  one after the other with the other lanes masked off. Costs key, histogram,
  *  scan and scatter after every bounce; a permutation, so nothing is dropped. */
@@ -1254,7 +1190,7 @@ static int sortPathsByMaterial(
 }
 #endif
 
-/** One iteration: trace, sort, shade, compact - then add the result to the image. */
+// One iteration: trace, sort, shade, compact, then add the result to the image
 void pathtrace(uchar4* pbo, int frame, int iter)
 {
     const int traceDepth = hst_scene->state.traceDepth;
@@ -1270,8 +1206,6 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     // 1D block for path tracing
     const int blockSize1d = 128;
 
-    ///////////////////////////////////////////////////////////////////////////
-
     generateRayFromCamera<<<blocksPerGrid2d, blockSize2d>>>(cam, iter, traceDepth, dev_paths);
     checkCUDAError("generate camera ray");
 
@@ -1282,14 +1216,13 @@ void pathtrace(uchar4* pbo, int frame, int iter)
     int depth = 0;
     int num_paths = pixelcount;
 
-    // Working arrays: with compaction the two pairs ping-pong, so the survivors
-    // scattered into the "other" arrays become the next bounce's input
+    // Working arrays: with compaction the two pairs ping-pong
     PathSegment* paths = dev_paths;
     PathSegment* pathsOther = dev_pathsAlt;
     ShadeableIntersection* intersections = dev_intersections;
     ShadeableIntersection* intersectionsOther = dev_intersectionsAlt;
 
-    // --- PathSegment Tracing Stage ---
+    // PathSegment Tracing Stage
     // Shoot ray into scene, bounce between objects, push shading chunks
 
     // The loop stops when the segment budget is used up, or - with stream
@@ -1315,16 +1248,14 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         statsTrace().end();
         checkCUDAError("trace one bounce");
 
-        // --- Sorting stage ---
-        // Reorder the pairs into one run per material so that the shading
-        // kernel's per-material branches are warp-uniform. SORT_BY_MATERIAL 0 is
-        // the "shaded directly" side of the comparison the base code asked for.
+        // Sorting stage 
+        // Reorder the pairs into one run per material
+
 #if MATERIAL_SORT_STATS || SORT_BY_MATERIAL
-        // How mixed the warps are as the paths stand, measured on bounces 1 and 6
-        // of the first iteration
         const bool reportMix = MATERIAL_SORT_STATS && iter == 1
             && (depth == 0 || depth == 5);
 #endif
+
 #if MATERIAL_SORT_STATS
         if (reportMix)
         {
@@ -1333,6 +1264,7 @@ void pathtrace(uchar4* pbo, int frame, int iter)
             reportMaterialMix(num_paths, intersections, (int)hst_scene->materials.size(), tag);
         }
 #endif
+
 #if SORT_BY_MATERIAL
         statsSort().begin();
         sortPathsByMaterial(num_paths, paths, pathsOther, intersections, intersectionsOther,
@@ -1348,9 +1280,9 @@ void pathtrace(uchar4* pbo, int frame, int iter)
         }
 #endif
 
-        // --- Shading Stage ---
-        // Evaluate the BSDF, accumulate emitter hits into dev_image and generate
-        // the next ray of every still-living path
+        // Shading Stage
+        // Evaluate the BSDF, accumulate emitter hits into dev_image 
+        // and generate the next ray of every still-living path
         statsShade().begin();
         shadeMaterials<<<numblocksPathSegmentTracing, blockSize1d>>>(
             iter,
